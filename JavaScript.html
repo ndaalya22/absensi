@@ -1,0 +1,2620 @@
+<script>
+// ════════════════════════════════════════════════════════
+// STATE GLOBAL
+// ════════════════════════════════════════════════════════
+const AppState = {
+  user: null,
+  santriCache: [],
+  chartInstances: {},
+  currentSection: 'dashboard',
+  deleteHandler: null,
+  appSettings: null,
+  surahListCache: [],
+  sesiListCache: []
+};
+
+const DAFTAR_SURAH = ['An-Nas','Al-Falaq','Al-Ikhlas','Al-Lahab','An-Nasr','Al-Kafirun','Al-Kautsar','Al-Ma\'un','Quraisy','Al-Fil','Al-Humazah','Al-\'Asr','At-Takatsur','Al-Qari\'ah','Al-\'Adiyat','Az-Zalzalah','Al-Bayyinah','Al-Qadr','Al-\'Alaq','At-Tin','Al-Insyirah','Ad-Dhuha','Al-Lail','Asy-Syams','Al-Balad','Al-Fajr','Al-Ghasyiyah','Al-A\'la','At-Tariq','Al-Buruj','Al-Insyiqaq','Al-Mutaffifin','An-Naba\'','An-Nazi\'at','\'Abasa','At-Takwir','Al-Infitar','Al-Muthaffifin','Al-Mulk','Al-Qalam','Al-Haqqah','Al-Ma\'arij','Nuh','Al-Jinn','Al-Muzzammil','Al-Muddatsir','Al-Qiyamah','Al-Insan','Al-Mursalat'];
+
+// ════════════════════════════════════════════════════════
+// PENANGAN ERROR GLOBAL — mencegah "loading macet" tanpa pesan
+// ════════════════════════════════════════════════════════
+
+// Bungkus setiap proses render agar exception apapun langsung terlihat,
+// bukan membuat spinner macet selamanya (celah umum google.script.run).
+function safeRender(sectionId, workFn) {
+  try {
+    workFn();
+  } catch (e) {
+    console.error('[SIM Halaqah] Error di bagian ' + sectionId + ':', e);
+    const el = document.getElementById('section-' + sectionId) || document.getElementById(sectionId);
+    if (el) {
+      el.innerHTML = emptyState('bi-exclamation-triangle',
+        'Terjadi kesalahan saat menampilkan data (' + (e.message || e) + '). ' +
+        'Coba muat ulang halaman. Jika berulang, buka Console browser (F12) untuk detail teknis.');
+    }
+    showToast('Terjadi Kesalahan', e.message || String(e), 'danger');
+  }
+}
+
+// Bungkus setiap panggilan google.script.run agar kegagalan SELALU
+// mengganti tampilan loading, tidak hanya menampilkan toast sekilas.
+// Juga menangani celah dikenal Apps Script: google.script.run kadang
+// mengirim `null` ke success handler (bukan memanggil failure handler)
+// saat ada gangguan timing komunikasi iframe — kita retry otomatis 1x.
+function callServer(sectionIdOnFail, fnName, args, onSuccess, _isRetry) {
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res === null || res === undefined) {
+        if (!_isRetry) {
+          console.warn('[SIM Halaqah] Respon kosong dari ' + fnName + ', mencoba ulang otomatis...');
+          setTimeout(() => callServer(sectionIdOnFail, fnName, args, onSuccess, true), 500);
+          return;
+        }
+        console.error('[SIM Halaqah] ' + fnName + ' tetap mengembalikan respon kosong setelah retry.');
+        const el = document.getElementById('section-' + sectionIdOnFail) || document.getElementById(sectionIdOnFail);
+        if (el) {
+          el.innerHTML = emptyState('bi-exclamation-triangle',
+            'Server tidak memberi respon untuk "' + fnName + '" (dicoba 2x). Ini biasanya karena koneksi terputus sesaat atau sesi kadaluarsa. ' +
+            'Silakan muat ulang halaman (F5). Jika terus terjadi, cek tab Executions di Apps Script untuk melihat apakah ada error tersembunyi.')
+            + `<div class="text-center mt-2"><button class="btn-outline-app" onclick="runPingTest()">Tes Koneksi Server</button></div>`;
+        }
+        showToast('Tidak Ada Respon Server', 'Fungsi ' + fnName + ' tidak merespons setelah dicoba ulang.', 'danger');
+        return;
+      }
+      safeRender(sectionIdOnFail, () => onSuccess(res));
+    })
+    .withFailureHandler(err => {
+      console.error('[SIM Halaqah] Gagal memanggil ' + fnName + ':', err);
+      const el = document.getElementById('section-' + sectionIdOnFail) || document.getElementById(sectionIdOnFail);
+      if (el) {
+        el.innerHTML = emptyState('bi-wifi-off',
+          'Gagal terhubung ke server saat memuat data (' + fnName + '). Pesan: ' + (err.message || err) +
+          '. Silakan coba lagi atau muat ulang halaman.');
+      }
+      showToast('Gagal Memuat Data', err.message || String(err), 'danger');
+    })
+    [fnName](...(args || []));
+}
+
+window.addEventListener('error', (e) => {
+  console.error('[SIM Halaqah] Uncaught error:', e.error || e.message);
+});
+
+// Diagnostik manual: cek apakah kanal RPC ke server masih hidup sama sekali,
+// terlepas dari fungsi yang menyentuh Spreadsheet/Drive.
+function runPingTest() {
+  showToast('Menguji...', 'Mengirim ping ke server...', 'info');
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res && res.success) {
+        showToast('Koneksi Server OK', 'Server merespons normal (waktu server: ' + res.data.time + '). Masalah kemungkinan spesifik pada fungsi yang mengakses Spreadsheet/Drive, bukan koneksi secara umum.', 'success');
+      } else {
+        showToast('Ping Gagal', 'Server merespons tapi dengan hasil tidak terduga: ' + JSON.stringify(res), 'danger');
+      }
+    })
+    .withFailureHandler(err => {
+      showToast('Ping Gagal Total', 'Server benar-benar tidak bisa dihubungi: ' + err.message, 'danger');
+    })
+    .pingTest();
+}
+
+// ════════════════════════════════════════════════════════
+// KONFIGURASI NAVIGASI (per Peran)
+// ════════════════════════════════════════════════════════
+function getNavConfig(role) {
+  const admin = [
+    { section: 'dashboard', icon: 'bi-speedometer2', label: 'Dashboard' },
+    { section: 'santriData', icon: 'bi-people', label: 'Data Santri' },
+    { section: 'setoranInput', icon: 'bi-journal-plus', label: 'Input Setoran' },
+    { section: 'setoranHistory', icon: 'bi-journal-text', label: 'Riwayat Setoran' },
+    { section: 'attendance', icon: 'bi-calendar-check', label: 'Absensi' },
+    { section: 'leaderboard', icon: 'bi-trophy', label: 'Papan Peringkat' },
+    { section: 'rapor', icon: 'bi-clipboard-data', label: 'Rapor Santri' },
+    { section: 'jumlahHafalan', icon: 'bi-bookmark-star', label: 'Jumlah Hafalan' },
+    { section: 'laporan', icon: 'bi-send', label: 'Generator Laporan' },
+    { section: 'liburan', icon: 'bi-airplane', label: 'Mode Liburan' },
+    { section: 'dataMaster', icon: 'bi-database', label: 'Data Master' },
+    { section: 'pengumuman', icon: 'bi-megaphone', label: 'Pengumuman' },
+    { section: 'settings', icon: 'bi-gear', label: 'Pengaturan' }
+  ];
+  const koordinator = [
+    { section: 'dashboard', icon: 'bi-graph-up-arrow', label: 'Dashboard Analisa' },
+    { section: 'dataGuru', icon: 'bi-person-badge', label: 'Data Guru' },
+    { section: 'santriData', icon: 'bi-people', label: 'Data Santri' },
+    { section: 'leaderboard', icon: 'bi-trophy', label: 'Papan Peringkat' },
+    { section: 'rapor', icon: 'bi-clipboard-data', label: 'Rapor Santri' },
+    { section: 'liburan', icon: 'bi-airplane', label: 'Mode Liburan' },
+    { section: 'pengumuman', icon: 'bi-megaphone', label: 'Pengumuman' },
+    { section: 'dataMaster', icon: 'bi-database', label: 'Data Master' },
+    { section: 'laporanOrganisasi', icon: 'bi-bar-chart-line', label: 'Generate Laporan' },
+    { section: 'settings', icon: 'bi-gear', label: 'Pengaturan' }
+  ];
+  const ortu = [
+    { section: 'dashboard', icon: 'bi-house', label: 'Beranda' },
+    { section: 'setoranHistory', icon: 'bi-journal-text', label: 'Riwayat Setoran' },
+    { section: 'rapor', icon: 'bi-clipboard-data', label: 'Grafik Perkembangan' },
+    { section: 'attendance', icon: 'bi-calendar-check', label: 'Rekap Kehadiran' },
+    { section: 'leaderboard', icon: 'bi-trophy', label: 'Papan Peringkat' },
+    { section: 'liburan', icon: 'bi-airplane', label: 'Murojaah Liburan' }
+  ];
+  if (role === 'Koordinator') return koordinator;
+  if (role === 'Super Admin') return admin;
+  return ortu;
+}
+
+// Label tampilan peran mengikuti alur hierarki baru — TIDAK mengubah nilai
+// data asli (tetap 'Super Admin'/'Koordinator'/'Orang Tua' di sheet & kode)
+// agar 100% kompatibel dengan data yang sudah ada.
+function roleLabel(role) {
+  if (role === 'Koordinator') return 'Super Admin (Koordinator)';
+  if (role === 'Super Admin') return 'Admin (Guru/Ustadz)';
+  return 'Orang Tua';
+}
+
+function getBottomNavConfig(role) {
+  if (role === 'Koordinator') {
+    return [
+      { section: 'dashboard', icon: 'bi-graph-up-arrow', label: 'Analisa' },
+      { section: 'dataGuru', icon: 'bi-person-badge', label: 'Guru' },
+      { section: 'santriData', icon: 'bi-people', label: 'Santri' },
+      { section: 'laporanOrganisasi', icon: 'bi-bar-chart-line', label: 'Laporan' },
+      { section: '__more__', icon: 'bi-list', label: 'More' }
+    ];
+  }
+  if (role === 'Super Admin') {
+    return [
+      { section: 'dashboard', icon: 'bi-house', label: 'Home' },
+      { section: 'santriData', icon: 'bi-people', label: 'Santri' },
+      { section: 'setoranHistory', icon: 'bi-journal-text', label: 'Log' },
+      { section: 'attendance', icon: 'bi-calendar-check', label: 'Absen' },
+      { section: '__more__', icon: 'bi-list', label: 'More' }
+    ];
+  }
+  return [
+    { section: 'dashboard', icon: 'bi-house', label: 'Home' },
+    { section: 'setoranHistory', icon: 'bi-journal-text', label: 'Setoran' },
+    { section: 'rapor', icon: 'bi-bar-chart', label: 'Grafik' },
+    { section: '__more__', icon: 'bi-list', label: 'More' }
+  ];
+}
+
+// ════════════════════════════════════════════════════════
+// INISIALISASI
+// ════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', () => {
+  const savedTheme = localStorage.getItem('simhalaqah-theme') || 'light';
+  document.documentElement.setAttribute('data-theme', savedTheme);
+  document.getElementById('darkModeToggle').checked = (savedTheme === 'dark');
+
+  loadCurrentUser();
+});
+
+function loadCurrentUser(_isRetry) {
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res === null || res === undefined) {
+        if (!_isRetry) {
+          console.warn('[SIM Halaqah] Respon kosong dari getCurrentUserInfo, mencoba ulang...');
+          setTimeout(() => loadCurrentUser(true), 500);
+          return;
+        }
+        showFatalError('Server tidak merespons saat memuat sesi Anda. Silakan muat ulang halaman (F5).');
+        return;
+      }
+      if (res.success) {
+        onUserLoaded(res);
+      } else if (res.message === 'AUTO_LOGIN_GAGAL') {
+        // Bukan Super Admin (Google) — tampilkan form login manual Orang Tua
+        showOrtuLoginScreen();
+      } else {
+        showFatalError(res.message);
+      }
+    })
+    .withFailureHandler(err => showFatalError(err.message || 'Gagal memuat aplikasi.'))
+    .getCurrentUserInfo();
+}
+
+function showOrtuLoginScreen() {
+  document.getElementById('loadingOverlay').classList.add('d-none');
+  document.getElementById('ortuLoginScreen').classList.remove('d-none');
+}
+
+function submitOrtuLogin() {
+  const username = document.getElementById('ortuLoginEmail').value.trim();
+  const password = document.getElementById('ortuLoginPassword').value;
+  const errEl = document.getElementById('ortuLoginError');
+  errEl.classList.add('d-none');
+  if (!username || !password) { errEl.textContent = 'Username dan password wajib diisi.'; errEl.classList.remove('d-none'); return; }
+
+  const btn = document.getElementById('btnOrtuLogin');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Memeriksa...';
+  btn.disabled = true;
+
+  google.script.run
+    .withSuccessHandler(res => {
+      btn.innerHTML = originalText; btn.disabled = false;
+      if (!res) { errEl.textContent = 'Server tidak merespons. Coba lagi.'; errEl.classList.remove('d-none'); return; }
+      if (res.success) {
+        document.getElementById('ortuLoginScreen').classList.add('d-none');
+        onUserLoaded(res);
+      } else {
+        errEl.textContent = res.message;
+        errEl.classList.remove('d-none');
+      }
+    })
+    .withFailureHandler(err => {
+      btn.innerHTML = originalText; btn.disabled = false;
+      errEl.textContent = 'Gagal terhubung ke server: ' + err.message;
+      errEl.classList.remove('d-none');
+    })
+    .loginOrtu(username, password);
+}
+
+function onUserLoaded(res) {
+  if (!res.success) {
+    showFatalError(res.message);
+    return;
+  }
+  AppState.user = res.data;
+  document.getElementById('loadingOverlay').classList.add('d-none');
+  document.getElementById('appShell').classList.remove('d-none');
+
+  renderNavigation();
+  renderUserChip();
+
+  if (AppState.user.role === 'Orang Tua' && !AppState.user.idSantriTerkait) {
+    showToast('Peringatan', 'Akun Anda belum terhubung ke data santri. Hubungi Ustadz.', 'warning');
+  }
+
+  // Muat pengaturan tampilan (logo/warna) DULU, baru navigasi ke dashboard —
+  // sengaja dibuat berurutan (bukan bersamaan) untuk menghindari race condition
+  // saat beberapa google.script.run ditembak bersamaan di momen awal load.
+  applyAppSettings(() => navigateTo('dashboard'));
+  loadNotifBadge();
+}
+
+// ════════════════════════════════════════════════════════
+// NOTIFIKASI / PENGUMUMAN (lonceng di topbar)
+// ════════════════════════════════════════════════════════
+function loadNotifBadge() {
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res && res.success && res.data.length > 0) {
+        document.getElementById('notifBadgeDot').classList.remove('d-none');
+      }
+      AppState.pengumumanAktif = (res && res.success) ? res.data : [];
+    })
+    .withFailureHandler(() => {})
+    .getPengumumanAktif(AppState.user.role);
+}
+
+function toggleNotifPanel() {
+  const panel = document.getElementById('notifPanel');
+  const isHidden = panel.classList.contains('d-none');
+  if (isHidden) {
+    renderNotifPanel(AppState.pengumumanAktif || []);
+    panel.classList.remove('d-none');
+    // Muat ulang data terbaru setiap kali dibuka
+    google.script.run
+      .withSuccessHandler(res => { if (res && res.success) { AppState.pengumumanAktif = res.data; renderNotifPanel(res.data); } })
+      .withFailureHandler(() => {})
+      .getPengumumanAktif(AppState.user.role);
+  } else {
+    panel.classList.add('d-none');
+  }
+}
+
+function renderNotifPanel(list) {
+  const el = document.getElementById('notifPanelContent');
+  if (!list || list.length === 0) {
+    el.innerHTML = `<div class="text-center py-4" style="color:var(--text-muted);font-size:13px"><i class="bi bi-bell-slash" style="font-size:26px;display:block;margin-bottom:6px"></i>Belum ada pengumuman.</div>`;
+    return;
+  }
+  el.innerHTML = list.map(p => `
+    <div class="notif-item">
+      <div class="notif-item-title">${escapeHtml(p.Judul)}</div>
+      <div class="notif-item-body">${escapeHtml(p.Isi)}</div>
+      ${p.LampiranURL ? `<a href="${p.LampiranURL}" target="_blank" class="notif-item-link"><i class="bi bi-paperclip"></i> ${escapeHtml(p.LampiranNama || 'Lihat lampiran')}</a><br>` : ''}
+      ${p.LinkEksternal ? `<a href="${p.LinkEksternal}" target="_blank" class="notif-item-link"><i class="bi bi-link-45deg"></i> Buka link</a>` : ''}
+      <div class="notif-item-date">${p.TanggalDibuat}</div>
+    </div>
+  `).join('');
+}
+
+// Tutup panel notifikasi jika klik di luar area panel/bell
+document.addEventListener('click', (e) => {
+  const panel = document.getElementById('notifPanel');
+  const bell = document.getElementById('notifBellBtn');
+  if (panel && !panel.classList.contains('d-none') && !panel.contains(e.target) && !bell.contains(e.target)) {
+    panel.classList.add('d-none');
+  }
+});
+
+function showFatalError(msg) {
+  document.getElementById('loadingOverlay').classList.add('d-none');
+  document.getElementById('errorScreenMsg').textContent = msg;
+  document.getElementById('errorScreen').classList.remove('d-none');
+}
+
+// Terapkan logo & warna kustom (jika sudah diset lewat Pengaturan Aplikasi)
+function applyAppSettings(onDone) {
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res && res.success) {
+        AppState.appSettings = res.data;
+        if (res.data.appName) document.getElementById('appTitle').textContent = res.data.appName;
+        setLogoImage(document.getElementById('appLogoIcon'), res.data.logoUrl);
+        if (res.data.primaryColor) document.documentElement.style.setProperty('--primary', res.data.primaryColor);
+        if (res.data.secondaryColor) document.documentElement.style.setProperty('--secondary-gold', res.data.secondaryColor);
+      }
+      if (onDone) onDone();
+    })
+    .withFailureHandler(err => { console.warn('Gagal memuat pengaturan aplikasi:', err.message); if (onDone) onDone(); })
+    .getAppSettings();
+}
+
+// Pasang logo dengan aman — jika gambar gagal dimuat, otomatis kembali ke ikon buku
+// (mencegah broken-image icon merusak tampilan sidebar/pratinjau).
+function setLogoImage(containerEl, logoUrl) {
+  if (!containerEl) return;
+  if (!logoUrl) { containerEl.innerHTML = '<i class="bi bi-book-half"></i>'; return; }
+  const img = document.createElement('img');
+  img.src = logoUrl;
+  img.alt = 'Logo';
+  img.onerror = () => { containerEl.innerHTML = '<i class="bi bi-book-half"></i>'; };
+  containerEl.innerHTML = '';
+  containerEl.appendChild(img);
+}
+
+// ════════════════════════════════════════════════════════
+// NAVIGASI SPA (TANPA RELOAD, TANPA ?page=)
+// ════════════════════════════════════════════════════════
+function navigateTo(sectionId) {
+  if (sectionId === '__more__') { openMoreSheet(); return; }
+
+  document.querySelectorAll('.content-section').forEach(s => s.classList.remove('active'));
+  const target = document.getElementById('section-' + sectionId);
+  if (target) target.classList.add('active');
+
+  AppState.currentSection = sectionId;
+  updateActiveNav(sectionId);
+  closeSidebarDrawer();
+  updateFabVisibility(sectionId);
+
+  const loaders = {
+    dashboard: () => {
+      if (AppState.user.role === 'Koordinator') loadDashboardKoordinator();
+      else if (AppState.user.role === 'Super Admin') loadDashboardAdmin();
+      else loadDashboardOrtu();
+    },
+    santriData: loadSantriData,
+    setoranInput: loadSetoranInputForm,
+    setoranHistory: loadSetoranHistory,
+    attendance: loadAttendanceSection,
+    leaderboard: loadLeaderboard,
+    rapor: loadRaporSection,
+    jumlahHafalan: loadJumlahHafalanSection,
+    laporan: loadLaporanSection,
+    liburan: loadLiburanSection,
+    dataMaster: loadDataMasterSection,
+    pengumuman: loadPengumumanSection,
+    settings: loadSettingsSection,
+    dataGuru: loadDataGuruSection,
+    laporanOrganisasi: loadLaporanOrganisasiSection
+  };
+  if (loaders[sectionId]) loaders[sectionId]();
+}
+
+function updateActiveNav(sectionId) {
+  document.querySelectorAll('#sidebarNav .nav-link').forEach(l => l.classList.toggle('active', l.dataset.section === sectionId));
+  document.querySelectorAll('#bottomNav .bn-item').forEach(l => l.classList.toggle('active', l.dataset.section === sectionId));
+}
+
+function renderNavigation() {
+  const nav = getNavConfig(AppState.user.role);
+  const sidebarNav = document.getElementById('sidebarNav');
+  sidebarNav.innerHTML = nav.map(item => `
+    <li><a href="javascript:void(0)" class="nav-link" data-section="${item.section}" onclick="navigateTo('${item.section}')">
+      <i class="bi ${item.icon}"></i><span>${item.label}</span>
+    </a></li>
+  `).join('');
+
+  const bottomNav = getBottomNavConfig(AppState.user.role);
+  document.getElementById('bottomNav').innerHTML = bottomNav.map(item => `
+    <button class="bn-item" data-section="${item.section}" onclick="navigateTo('${item.section}')">
+      <i class="bi ${item.icon}"></i><span>${item.label}</span>
+    </button>
+  `).join('');
+
+  if (AppState.user.role !== 'Super Admin') {
+    document.getElementById('btnQuickAbsen').classList.add('d-none');
+  }
+}
+
+function openMoreSheet() {
+  const nav = getNavConfig(AppState.user.role);
+  const shownInBottom = getBottomNavConfig(AppState.user.role).map(i => i.section);
+  const rest = nav.filter(i => !shownInBottom.includes(i.section));
+  const html = `
+    <div class="modal fade" id="moreSheetModal" tabindex="-1">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header"><h5 class="modal-title">Menu Lainnya</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+          <div class="modal-body p-2">
+            ${rest.map(i => `<a href="javascript:void(0)" class="nav-link d-flex" style="color:var(--text-primary)" data-bs-dismiss="modal" onclick="navigateTo('${i.section}')"><i class="bi ${i.icon} me-2"></i>${i.label}</a>`).join('')}
+            <a href="javascript:void(0)" class="nav-link d-flex text-danger" data-bs-dismiss="modal" onclick="toggleDarkMode()"><i class="bi bi-moon-stars me-2"></i>Mode Gelap</a>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('moreSheetModal')?.remove();
+  document.body.insertAdjacentHTML('beforeend', html);
+  new bootstrap.Modal(document.getElementById('moreSheetModal')).show();
+}
+
+function updateFabVisibility(sectionId) {
+  const fab = document.getElementById('fabAdd');
+  const show = (AppState.user.role === 'Super Admin' && sectionId === 'santriData')
+    || (AppState.user.role === 'Koordinator' && sectionId === 'dataGuru');
+  fab.style.display = show ? 'flex' : 'none';
+}
+function handleFabClick() {
+  if (AppState.currentSection === 'santriData') openSantriModal(null);
+  else if (AppState.currentSection === 'dataGuru') openGuruModal(null);
+}
+
+function openSidebarDrawer() { document.getElementById('sidebar').classList.add('open'); document.getElementById('sidebarOverlay').classList.add('show'); }
+function closeSidebarDrawer() { document.getElementById('sidebar').classList.remove('open'); document.getElementById('sidebarOverlay').classList.remove('show'); }
+
+// ════════════════════════════════════════════════════════
+// DARK MODE
+// ════════════════════════════════════════════════════════
+function toggleDarkMode() {
+  const html = document.documentElement;
+  const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('simhalaqah-theme', next);
+  document.getElementById('darkModeToggle').checked = (next === 'dark');
+  updateChartsTheme(next);
+}
+
+// ════════════════════════════════════════════════════════
+// TOAST & UI HELPERS
+// ════════════════════════════════════════════════════════
+function showToast(title, msg, type) {
+  const toastEl = document.getElementById('appToast');
+  document.getElementById('toastTitle').textContent = title;
+  document.getElementById('toastBody').textContent = msg;
+  const icons = { success: '✅', danger: '⚠️', warning: '⚠️', info: 'ℹ️' };
+  document.getElementById('toastIcon').textContent = icons[type] || 'ℹ️';
+  new bootstrap.Toast(toastEl, { delay: 4000 }).show();
+}
+
+function showLoadingIn(elId) {
+  const el = document.getElementById(elId);
+  if (el) el.innerHTML = `<div class="text-center py-5"><div class="loading-spinner mx-auto"></div><p class="mt-3" style="color:var(--text-muted);font-size:13px">Memuat data...</p></div>`;
+}
+
+function emptyState(icon, text) {
+  return `<div class="empty-state"><i class="bi ${icon}"></i><p>${text}</p></div>`;
+}
+
+function initials(name) {
+  if (!name) return '?';
+  return name.split(' ').filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+}
+
+function avatarHtml(fotoUrl, nama, size) {
+  const sizeStyle = size ? `style="width:${size}px;height:${size}px;font-size:${size * 0.35}px;"` : '';
+  if (fotoUrl) return `<div class="avatar-circle" ${sizeStyle}><img src="${fotoUrl}" alt="${nama || ''}" onerror="this.style.display='none';this.parentElement.textContent='${initials(nama)}'"></div>`;
+  return `<div class="avatar-circle" ${sizeStyle}>${initials(nama)}</div>`;
+}
+
+function gradeFromNilai(n) {
+  n = Number(n);
+  if (n >= 90) return 'Mumtaz (A)';
+  if (n >= 80) return 'Jayyid Jiddan (B+)';
+  if (n >= 70) return 'Jayyid (B)';
+  if (n >= 60) return 'Maqbul (C)';
+  return 'Perlu Bimbingan (D)';
+}
+
+function renderUserChip() {
+  const u = AppState.user;
+  const isStaff = (u.role === 'Super Admin' || u.role === 'Koordinator');
+  const name = isStaff ? (u.email.split('@')[0]) : (u.santri ? u.santri.NamaOrtu || u.username || u.email : u.username || u.email);
+  document.getElementById('userChip').innerHTML = `
+    ${avatarHtml('', name, 32)}
+    <div class="user-chip-info">
+      <div class="user-chip-name">${name}</div>
+      <div class="user-chip-role">${roleLabel(u.role)}</div>
+    </div>`;
+  document.getElementById('topbarUser').innerHTML = `
+    <div class="text-end">
+      <div class="topbar-user-name">${name}</div>
+      <div class="topbar-user-role">${roleLabel(u.role)}</div>
+    </div>
+    ${avatarHtml('', name, 38)}`;
+}
+
+function confirmDeleteAction(handlerFn) {
+  AppState.deleteHandler = handlerFn;
+  const modal = new bootstrap.Modal(document.getElementById('deleteModal'));
+  document.getElementById('confirmDeleteBtn').onclick = () => {
+    AppState.deleteHandler();
+    modal.hide();
+  };
+  modal.show();
+}
+
+// Pastikan daftar santri tersedia sebelum dipakai dropdown manapun,
+// TIDAK bergantung pada apakah user sudah pernah membuka Data Santri.
+// Sama seperti callServer: retry otomatis 1x jika respon kosong (null).
+function ensureSantriCache(callback, _isRetry) {
+  if (AppState.santriCache && AppState.santriCache.length > 0) { callback(AppState.santriCache); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res === null || res === undefined) {
+        if (!_isRetry) {
+          console.warn('[SIM Halaqah] Respon kosong dari getAllSantri, mencoba ulang otomatis...');
+          setTimeout(() => ensureSantriCache(callback, true), 500);
+          return;
+        }
+        showToast('Error', 'Server tidak merespons saat memuat daftar santri. Muat ulang halaman.', 'danger');
+        callback([]);
+        return;
+      }
+      AppState.santriCache = res.success ? res.data : [];
+      callback(AppState.santriCache);
+    })
+    .withFailureHandler(err => { showToast('Error', 'Gagal memuat daftar santri: ' + err.message, 'danger'); callback([]); })
+    .getAllSantri();
+}
+
+// ════════════════════════════════════════════════════════
+// DASHBOARD — SUPER ADMIN
+// ════════════════════════════════════════════════════════
+function loadDashboardAdmin() {
+  showLoadingIn('section-dashboard');
+  callServer('dashboard', 'getDashboardAdmin', [], renderDashboardAdmin);
+}
+
+function renderDashboardAdmin(res) {
+  if (!res.success) { document.getElementById('section-dashboard').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  const d = res.data;
+  document.getElementById('section-dashboard').innerHTML = `
+    <div class="card-hero mb-4 d-flex justify-content-between align-items-center flex-wrap gap-3">
+      <div>
+        <h2>Assalamu'alaikum, Ustadz!</h2>
+        <p>Alhamdulillah, hari ini ada ${d.totalSantri} santri aktif. Mari pantau perkembangan hafalan mereka.</p>
+      </div>
+      <button class="btn-gold-app" onclick="navigateTo('laporan')"><i class="bi bi-trophy me-1"></i> Generate Laporan</button>
+    </div>
+
+    <div class="row g-3 mb-4">
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-people"></i></div><div><div class="kpi-label">Total Santri</div><div class="kpi-value">${d.totalSantri}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-book"></i></div><div><div class="kpi-label">Ayat Terhafal</div><div class="kpi-value">${d.totalAyat}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-clock-history"></i></div><div><div class="kpi-label">Sesi Aktif Hari Ini</div><div class="kpi-value">${d.activeSessions}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-star"></i></div><div><div class="kpi-label">Rata-rata Nilai</div><div class="kpi-value">${d.avgNilai}</div></div></div></div>
+    </div>
+
+    <div class="card-app mb-4">
+      <div class="section-title">Grafik Perkembangan Hafalan</div>
+      <div class="section-subtitle">Total ayat terhafal 7 hari terakhir</div>
+      <canvas id="chartGrowthAdmin" height="90"></canvas>
+    </div>
+
+    <div class="row g-3">
+      <div class="col-lg-8">
+        <div class="card-app">
+          <div class="section-title">Insight</div>
+          <ul class="mb-0" style="color:var(--text-secondary); font-size:14px;">
+            ${d.insights.map(i => `<li class="mb-1">${i}</li>`).join('')}
+          </ul>
+        </div>
+      </div>
+      <div class="col-lg-4">
+        <div class="card-app h-100 d-flex flex-column justify-content-center align-items-center text-center">
+          <i class="bi bi-calendar-check" style="font-size:32px;color:var(--primary)"></i>
+          <p class="mb-2 mt-2" style="font-size:13.5px;color:var(--text-secondary)">Belum absen hari ini?</p>
+          <button class="btn-primary-app" onclick="navigateTo('attendance')">Absensi Cepat</button>
+        </div>
+      </div>
+    </div>
+  `;
+  try { renderGrowthChart('chartGrowthAdmin', d.growthLabels, d.growthValues); } catch (e) { console.error('Chart error:', e); }
+}
+
+// ════════════════════════════════════════════════════════
+// DASHBOARD — ORANG TUA
+// ════════════════════════════════════════════════════════
+function loadDashboardOrtu() {
+  if (!AppState.user.idSantriTerkait) {
+    document.getElementById('section-dashboard').innerHTML = emptyState('bi-person-x', 'Akun Anda belum terhubung ke data santri. Hubungi Ustadz.');
+    return;
+  }
+  showLoadingIn('section-dashboard');
+  callServer('dashboard', 'getDashboardOrtu', [AppState.user.idSantriTerkait], renderDashboardOrtu);
+}
+
+function renderDashboardOrtu(res) {
+  if (!res.success) { document.getElementById('section-dashboard').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  const d = res.data;
+  const maxVal = Math.max(...d.growthValues, 1);
+  document.getElementById('section-dashboard').innerHTML = `
+    <div class="card-hero mb-4 d-flex align-items-center gap-3 flex-wrap">
+      <div style="width:56px;height:56px;border-radius:50%;overflow:hidden;flex-shrink:0;border:2px solid rgba(255,255,255,.4)">${avatarHtml(d.santri.FotoProfilURL, d.santri.NamaLengkap, 56)}</div>
+      <div>
+        <h2 class="mb-1">Assalamu'alaikum!</h2>
+        <p>Perkembangan hafalan ${d.santri.NamaLengkap} minggu ini terpantau baik. Total ${d.totalAyat} ayat sudah dihafal.</p>
+      </div>
+    </div>
+
+    <div class="row g-3 mb-4">
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-book"></i></div><div><div class="kpi-label">Total Ayat</div><div class="kpi-value">${d.totalAyat}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-star"></i></div><div><div class="kpi-label">Rata-rata Nilai</div><div class="kpi-value">${d.avgNilai}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-calendar-check"></i></div><div><div class="kpi-label">Kehadiran</div><div class="kpi-value">${d.persenHadir}%</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-award"></i></div><div><div class="kpi-label">Grade Terkini</div><div class="kpi-value" style="font-size:16px">${d.setoranTerakhir[0] ? gradeFromNilai(d.setoranTerakhir[0].NilaiTotal) : '-'}</div></div></div></div>
+    </div>
+
+    <div class="row g-3">
+      <div class="col-lg-5">
+        <div class="card-app">
+          <div class="section-title">Progress Mingguan</div>
+          <div class="mini-bar-chart mt-3">
+            ${d.growthLabels.map((l, i) => `
+              <div style="flex:1;text-align:center;">
+                <div class="mini-bar ${i === d.growthLabels.length - 1 ? 'today' : ''}" style="height:${Math.max(6, (d.growthValues[i] / maxVal) * 80)}px;margin:0 auto;"></div>
+                <div class="mini-bar-label">${l.slice(0,5)}</div>
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-7">
+        <div class="card-app">
+          <div class="section-title">Setoran Terakhir</div>
+          ${d.setoranTerakhir.length === 0 ? emptyState('bi-journal', 'Belum ada setoran tercatat.') :
+            d.setoranTerakhir.map(s => `
+            <div class="d-flex justify-content-between align-items-center py-2" style="border-bottom:1px solid var(--border-color-soft)">
+              <div>
+                <div style="font-weight:600;font-size:14px">${s.Surah} (${s.AyatMulai}-${s.AyatSelesai})</div>
+                <div style="font-size:12px;color:var(--text-muted)">${s.Tanggal} · ${s.JenisSetoran}</div>
+              </div>
+              <span class="chip chip-hadir">Nilai ${s.NilaiTotal}</span>
+            </div>`).join('')}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ════════════════════════════════════════════════════════
+// CHART HELPERS
+// ════════════════════════════════════════════════════════
+function renderGrowthChart(canvasId, labels, values) {
+  const ctx = document.getElementById(canvasId);
+  if (!ctx) return;
+  if (AppState.chartInstances[canvasId]) AppState.chartInstances[canvasId].destroy();
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  AppState.chartInstances[canvasId] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels.map(l => l.slice(0, 5)),
+      datasets: [{
+        label: 'Ayat Terhafal', data: values, borderColor: '#40916C', backgroundColor: 'rgba(64,145,108,0.12)',
+        fill: true, tension: 0.4, pointBackgroundColor: '#0f5238', pointRadius: 4
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: isDark ? '#c1cac3' : '#707973' } },
+        y: { beginAtZero: true, grid: { color: isDark ? '#2e3a35' : '#e1e3e4' }, ticks: { color: isDark ? '#c1cac3' : '#707973' } }
+      }
+    }
+  });
+}
+
+function updateChartsTheme(theme) {
+  Object.keys(AppState.chartInstances).forEach(key => {
+    const chart = AppState.chartInstances[key];
+    const isDark = theme === 'dark';
+    if (chart.options.scales) {
+      chart.options.scales.x.ticks.color = isDark ? '#c1cac3' : '#707973';
+      chart.options.scales.y.ticks.color = isDark ? '#c1cac3' : '#707973';
+      chart.options.scales.y.grid.color = isDark ? '#2e3a35' : '#e1e3e4';
+    }
+    chart.update();
+  });
+}
+
+// ════════════════════════════════════════════════════════
+// DATA SANTRI (ADMIN)
+// ════════════════════════════════════════════════════════
+function loadSantriData() {
+  showLoadingIn('section-santriData');
+  callServer('santriData', 'getAllSantri', [], res => {
+    google.script.run
+      .withSuccessHandler(guruRes => renderSantriData(res, guruRes.success ? guruRes.data : []))
+      .withFailureHandler(() => renderSantriData(res, []))
+      .getAllDataGuru();
+  });
+}
+
+function renderSantriData(res, guruList) {
+  if (!res.success) { document.getElementById('section-santriData').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  AppState.santriCache = res.data;
+  AppState.guruCache = guruList || [];
+  const guruMap = {};
+  (guruList || []).forEach(g => guruMap[g.ID] = g.NamaLengkap);
+
+  const santriListHtml = res.data.length === 0 ? emptyState('bi-people', 'Belum ada data santri. Klik tombol tambah untuk memulai.') :
+    res.data.map(s => `
+    <div class="col-md-6 col-lg-4">
+      <div class="card-app santri-card">
+        <div class="santri-card-top">
+          ${avatarHtml(s.FotoProfilURL, s.NamaLengkap, 48)}
+          <div class="flex-fill">
+            <div class="santri-card-name">${escapeHtml(s.NamaLengkap)}</div>
+            <div class="santri-card-sub">${escapeHtml(s.Nickname || '-')} · ${escapeHtml(s.StatusAktif)}</div>
+          </div>
+          <div class="dropdown">
+            <button class="icon-btn" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>
+            <ul class="dropdown-menu dropdown-menu-end">
+              <li><a class="dropdown-item" href="javascript:void(0)" onclick="openSantriModalById('${s.ID}')"><i class="bi bi-pencil me-2"></i>Edit</a></li>
+              <li><a class="dropdown-item text-danger" href="javascript:void(0)" onclick="handleDeleteSantri('${s.ID}')"><i class="bi bi-trash me-2"></i>Hapus</a></li>
+            </ul>
+          </div>
+        </div>
+        ${s.IDGuru ? `<span class="chip chip-hadir" style="align-self:flex-start"><i class="bi bi-person-badge"></i> Guru: ${escapeHtml(guruMap[s.IDGuru] || 'Tidak diketahui')}</span>` : `<span class="chip chip-alpha" style="align-self:flex-start">Belum ada Guru Pengampu</span>`}
+        <div class="santri-target-box">
+          <div style="font-size:12px;color:var(--text-muted)">Orang Tua</div>
+          <div style="font-size:13.5px;font-weight:600">${escapeHtml(s.NamaOrtu || '-')}</div>
+          <div style="font-size:12px;color:var(--text-muted)">${escapeHtml(s.EmailOrtu || '-')}</div>
+        </div>
+        <button class="btn-outline-app w-100" onclick="navigateTo('rapor'); setTimeout(()=>selectRaporSantri('${s.ID}'), 150)"><i class="bi bi-clipboard-data me-1"></i> Lihat Rapor</button>
+      </div>
+    </div>`).join('');
+
+  document.getElementById('section-santriData').innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <div><div class="section-title mb-0">Data Santri</div><div class="section-subtitle mb-0">${res.data.length} santri terdaftar</div></div>
+      <button class="btn-primary-app d-none d-lg-inline-flex" onclick="openSantriModal(null)"><i class="bi bi-plus-lg me-1"></i> Tambah Santri</button>
+    </div>
+    <div class="row g-3">${santriListHtml}</div>
+  `;
+}
+
+// Cegah karakter tanda kutip / HTML aneh pada nama merusak tampilan
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function openSantriModalById(id) {
+  const santriObj = AppState.santriCache.find(s => s.ID === id);
+  if (!santriObj) { showToast('Error', 'Data santri tidak ditemukan di cache. Muat ulang halaman.', 'danger'); return; }
+  openSantriModal(santriObj);
+}
+
+function openSantriModal(santriObj) {
+  const form = document.getElementById('formSantri');
+  form.reset();
+  document.getElementById('modalSantriTitle').textContent = santriObj ? 'Edit Santri' : 'Tambah Santri';
+
+  const guruSelect = document.getElementById('inputGuruPengampu');
+  const guruOptions = (AppState.guruCache || []).filter(g => g.Status === 'Aktif').map(g => `<option value="${g.ID}">${escapeHtml(g.NamaLengkap)}</option>`).join('');
+  guruSelect.innerHTML = '<option value="">Belum ditentukan</option>' + guruOptions;
+
+  if (santriObj) {
+    Object.keys(santriObj).forEach(k => {
+      const field = form.querySelector(`[name="${k}"]`);
+      if (field) field.value = santriObj[k];
+    });
+  }
+  new bootstrap.Modal(document.getElementById('modalSantri')).show();
+}
+
+function saveSantriForm() {
+  const form = document.getElementById('formSantri');
+  if (!form.checkValidity()) { form.reportValidity(); return; }
+  const formData = new FormData(form);
+  const record = {};
+  formData.forEach((v, k) => record[k] = v);
+  if (!record.ID) delete record.ID;
+
+  const btn = document.getElementById('btnSimpanSantri');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+
+  const resetBtn = () => { btn.innerHTML = originalText; btn.disabled = false; };
+  const fotoInput = document.getElementById('inputFotoSantri');
+
+  const finishSave = () => {
+    const action = record.ID ? 'updateSantri' : 'addSantri';
+    google.script.run
+      .withSuccessHandler(res => {
+        resetBtn();
+        if (res.success) {
+          showToast('Berhasil', res.message, 'success');
+          bootstrap.Modal.getInstance(document.getElementById('modalSantri')).hide();
+          loadSantriData();
+        } else { showToast('Gagal', res.message, 'danger'); }
+      })
+      .withFailureHandler(err => { resetBtn(); showToast('Error', err.message, 'danger'); })
+      [action](record);
+  };
+
+  if (fotoInput.files && fotoInput.files[0]) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = reader.result.split(',')[1];
+      google.script.run
+        .withSuccessHandler(uploadRes => {
+          if (uploadRes.success) { record.FotoProfilURL = uploadRes.data.fileUrl; finishSave(); }
+          else { resetBtn(); showToast('Gagal Upload', uploadRes.message, 'danger'); }
+        })
+        .withFailureHandler(err => { resetBtn(); showToast('Error', err.message, 'danger'); })
+        .uploadFileToDrive(base64, fotoInput.files[0].name, fotoInput.files[0].type, 'fotoFolderId');
+    };
+    reader.readAsDataURL(fotoInput.files[0]);
+  } else {
+    finishSave();
+  }
+}
+
+function handleDeleteSantri(id) {
+  confirmDeleteAction(() => {
+    google.script.run
+      .withSuccessHandler(res => {
+        if (res.success) { showToast('Berhasil', res.message, 'success'); loadSantriData(); }
+        else showToast('Gagal', res.message, 'danger');
+      })
+      .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+      .deleteSantri(id);
+  });
+}
+
+// Ambil daftar Surah dari Data Master (server); jika gagal, pakai cadangan lokal
+function getSurahListCached(callback) {
+  if (AppState.surahListCache && AppState.surahListCache.length > 0) { callback(AppState.surahListCache); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      AppState.surahListCache = (res && res.success && res.data.length > 0) ? res.data : DAFTAR_SURAH;
+      callback(AppState.surahListCache);
+    })
+    .withFailureHandler(() => { AppState.surahListCache = DAFTAR_SURAH; callback(DAFTAR_SURAH); })
+    .getSurahList();
+}
+
+const DAFTAR_SESI_DEFAULT = ['Sesi 1', 'Sesi 2', 'Sesi 3'];
+// Ambil daftar Sesi dari Data Master (server); jika gagal, pakai cadangan (Sesi 1-3, sama seperti sebelumnya)
+function getSesiListCached(callback) {
+  if (AppState.sesiListCache && AppState.sesiListCache.length > 0) { callback(AppState.sesiListCache); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      AppState.sesiListCache = (res && res.success && res.data.length > 0) ? res.data : DAFTAR_SESI_DEFAULT;
+      callback(AppState.sesiListCache);
+    })
+    .withFailureHandler(() => { AppState.sesiListCache = DAFTAR_SESI_DEFAULT; callback(DAFTAR_SESI_DEFAULT); })
+    .getSesiList();
+}
+
+// ════════════════════════════════════════════════════════
+// INPUT SETORAN (ADMIN)
+// ════════════════════════════════════════════════════════
+function loadSetoranInputForm() {
+  showLoadingIn('section-setoranInput');
+  callServer('setoranInput', 'getAllSantri', [], res => getSurahListCached(surahList => getSesiListCached(sesiList => renderSetoranInputForm(res.success ? res.data : [], surahList, sesiList))));
+}
+
+function renderSetoranInputForm(santriList, surahList, sesiList) {
+  const options = santriList.filter(s => s.StatusAktif === 'Aktif').map(s => `<option value="${s.ID}">${escapeHtml(s.NamaLengkap)}</option>`).join('');
+  const surahOptions = (surahList || DAFTAR_SURAH).map(s => `<option value="${s}">${s}</option>`).join('');
+  const sesiOptions = (sesiList || DAFTAR_SESI_DEFAULT).map(s => `<option>${escapeHtml(s)}</option>`).join('');
+
+  if (santriList.length === 0) {
+    document.getElementById('section-setoranInput').innerHTML = emptyState('bi-people', 'Belum ada data santri aktif. Tambahkan santri terlebih dahulu di menu Data Santri.');
+    return;
+  }
+
+  document.getElementById('section-setoranInput').innerHTML = `
+    <div class="section-title">Input Setoran Baru</div>
+    <div class="section-subtitle">Catat setoran hafalan santri hari ini</div>
+    <div class="row g-3">
+      <div class="col-lg-8">
+        <div class="card-app mb-3">
+          <div class="row g-3">
+            <div class="col-md-6"><label class="form-label">Nama Santri</label>
+              <select class="form-select" id="inpNamaSantri"><option value="">Pilih Santri...</option>${options}</select>
+            </div>
+            <div class="col-md-4"><label class="form-label">Tanggal</label><input type="date" class="form-control" id="inpTanggal" value="${new Date().toISOString().slice(0,10)}"></div>
+            <div class="col-md-2"><label class="form-label">Sesi</label>
+              <select class="form-select" id="inpSesi">${sesiOptions}</select>
+            </div>
+          </div>
+        </div>
+
+        <div class="card-app mb-3">
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <div class="section-title mb-0" style="font-size:16px">Detail Setoran</div>
+            <div class="toggle-pill-group" id="jenisToggle">
+              <button type="button" class="active" data-val="Hafalan Baru" onclick="setJenisSetoran(this,'Hafalan Baru')">Hafalan Baru</button>
+              <button type="button" data-val="Murojaah" onclick="setJenisSetoran(this,'Murojaah')">Murojaah</button>
+            </div>
+          </div>
+          <input type="hidden" id="inpJenisSetoran" value="Hafalan Baru">
+          <div class="mb-3"><label class="form-label">Surah</label><select class="form-select" id="inpSurah"><option value="">Pilih Surah...</option>${surahOptions}</select></div>
+          <div class="row g-3">
+            <div class="col-6"><label class="form-label">Ayat Mulai</label><input type="number" min="1" class="form-control" id="inpAyatMulai" oninput="updateTotalAyat()"></div>
+            <div class="col-6"><label class="form-label">Ayat Selesai</label><input type="number" min="1" class="form-control" id="inpAyatSelesai" oninput="updateTotalAyat()"></div>
+          </div>
+          <div class="mt-2" style="font-size:13px;color:var(--text-secondary)">Total Ayat: <strong id="totalAyatDisplay">0</strong></div>
+        </div>
+
+        <div class="card-app">
+          <label class="form-label">Catatan Ustadz</label>
+          <textarea class="form-control mb-3" id="inpCatatan" rows="3" placeholder="Masukkan catatan perkembangan santri..."></textarea>
+          <label class="form-label"><i class="bi bi-link-45deg"></i> Link Video YouTube (Opsional)</label>
+          <input type="url" class="form-control" id="inpYoutube" placeholder="https://youtube.com/...">
+        </div>
+      </div>
+
+      <div class="col-lg-4">
+        <div class="card-app mb-3">
+          <div class="section-title" style="font-size:16px">Penilaian</div>
+          <div class="rate-slider-group">
+            <div class="rate-slider-label"><span>Kelancaran</span><span class="rate-value" id="valKelancaran">80</span></div>
+            <input type="range" class="rate-slider" id="sliderKelancaran" min="0" max="100" value="80" oninput="updateNilaiTotal()">
+          </div>
+          <div class="rate-slider-group">
+            <div class="rate-slider-label"><span>Tajwid</span><span class="rate-value" id="valTajwid">80</span></div>
+            <input type="range" class="rate-slider" id="sliderTajwid" min="0" max="100" value="80" oninput="updateNilaiTotal()">
+          </div>
+          <div class="rate-slider-group mb-2">
+            <div class="rate-slider-label"><span>Adab</span><span class="rate-value" id="valAdab">80</span></div>
+            <input type="range" class="rate-slider" id="sliderAdab" min="0" max="100" value="80" oninput="updateNilaiTotal()">
+          </div>
+        </div>
+        <div class="nilai-total-card mb-3">
+          <div class="label">Nilai Total</div>
+          <div class="value" id="nilaiTotalDisplay">80.0</div>
+          <div class="grade" id="gradeDisplay">Jayyid Jiddan (B+)</div>
+        </div>
+        <button class="btn-primary-app w-100 mb-2" id="btnSimpanSetoran" onclick="submitSetoran()"><i class="bi bi-save me-1"></i> Simpan Setoran</button>
+        <button class="btn-outline-app w-100" onclick="navigateTo('dashboard')">Batal</button>
+      </div>
+    </div>
+  `;
+  updateNilaiTotal();
+}
+
+function setJenisSetoran(btn, val) {
+  document.querySelectorAll('#jenisToggle button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('inpJenisSetoran').value = val;
+}
+
+function updateTotalAyat() {
+  const mulai = Number(document.getElementById('inpAyatMulai').value) || 0;
+  const selesai = Number(document.getElementById('inpAyatSelesai').value) || 0;
+  document.getElementById('totalAyatDisplay').textContent = Math.max(0, selesai - mulai + 1);
+}
+
+function updateNilaiTotal() {
+  const k = Number(document.getElementById('sliderKelancaran').value);
+  const t = Number(document.getElementById('sliderTajwid').value);
+  const a = Number(document.getElementById('sliderAdab').value);
+  document.getElementById('valKelancaran').textContent = k;
+  document.getElementById('valTajwid').textContent = t;
+  document.getElementById('valAdab').textContent = a;
+  const total = Math.round(((k + t + a) / 3) * 10) / 10;
+  document.getElementById('nilaiTotalDisplay').textContent = total.toFixed(1);
+  document.getElementById('gradeDisplay').textContent = gradeFromNilai(total);
+}
+
+function submitSetoran() {
+  const idSantri = document.getElementById('inpNamaSantri').value;
+  const surah = document.getElementById('inpSurah').value;
+  if (!idSantri) { showToast('Peringatan', 'Pilih nama santri terlebih dahulu.', 'warning'); return; }
+  if (!surah) { showToast('Peringatan', 'Pilih surah terlebih dahulu.', 'warning'); return; }
+
+  const record = {
+    IDSantri: idSantri,
+    Tanggal: formatDateForSheet(document.getElementById('inpTanggal').value),
+    Sesi: document.getElementById('inpSesi').value,
+    JenisSetoran: document.getElementById('inpJenisSetoran').value,
+    Surah: surah,
+    AyatMulai: document.getElementById('inpAyatMulai').value,
+    AyatSelesai: document.getElementById('inpAyatSelesai').value,
+    NilaiKelancaran: document.getElementById('sliderKelancaran').value,
+    NilaiTajwid: document.getElementById('sliderTajwid').value,
+    NilaiAdab: document.getElementById('sliderAdab').value,
+    CatatanUstadz: document.getElementById('inpCatatan').value,
+    LinkYoutube: document.getElementById('inpYoutube').value
+  };
+
+  const btn = document.getElementById('btnSimpanSetoran');
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+
+  google.script.run
+    .withSuccessHandler(res => {
+      btn.innerHTML = '<i class="bi bi-save me-1"></i> Simpan Setoran'; btn.disabled = false;
+      if (res.success) {
+        showToast('Berhasil', 'Setoran tersimpan & notifikasi terkirim ke orang tua.', 'success');
+        navigateTo('setoranHistory');
+      } else { showToast('Gagal', res.message, 'danger'); }
+    })
+    .withFailureHandler(err => { btn.innerHTML = '<i class="bi bi-save me-1"></i> Simpan Setoran'; btn.disabled = false; showToast('Error', err.message, 'danger'); })
+    .addSetoran(record);
+}
+
+function formatDateForSheet(isoDate) {
+  if (!isoDate) return '';
+  const [y, m, d] = isoDate.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+// ════════════════════════════════════════════════════════
+// RIWAYAT SETORAN (BOTH)
+// ════════════════════════════════════════════════════════
+function loadSetoranHistory() {
+  showLoadingIn('section-setoranHistory');
+  ensureSantriCache(() => {
+    const isAdmin = AppState.user.role === 'Super Admin';
+    if (isAdmin) {
+      callServer('setoranHistory', 'getAllSetoran', [], res => renderSetoranHistory(res, true));
+    } else {
+      callServer('setoranHistory', 'getSetoranBySantri', [AppState.user.idSantriTerkait], res => renderSetoranHistory(res, false));
+    }
+  });
+}
+
+function renderSetoranHistory(res, isAdmin) {
+  if (!res.success) { document.getElementById('section-setoranHistory').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  if (res.data.length === 0) {
+    document.getElementById('section-setoranHistory').innerHTML = `<div class="section-title">Riwayat Setoran</div>` + emptyState('bi-journal', 'Belum ada riwayat setoran.');
+    return;
+  }
+  const santriMap = {};
+  AppState.santriCache.forEach(s => santriMap[s.ID] = s.NamaLengkap);
+
+  const buildRow = (s) => `
+    <tr>
+      ${isAdmin ? `<td>${escapeHtml(santriMap[s.IDSantri] || '-')}</td>` : ''}
+      <td>${s.Tanggal}</td>
+      <td>${s.Sesi}</td>
+      <td>${s.JenisSetoran}</td>
+      <td>${s.Surah} (${s.AyatMulai}-${s.AyatSelesai})</td>
+      <td><span class="chip chip-hadir">${s.NilaiTotal}</span></td>
+      <td>${s.LinkYoutube ? `<button class="icon-btn" onclick="previewYoutube('${s.LinkYoutube}')"><i class="bi bi-youtube" style="color:#ff0000"></i></button>` : '-'}</td>
+    </tr>`;
+
+  const renderTable = (rows) => `
+    <div class="card-app">
+      <div class="table-responsive-app">
+        <table class="table-app">
+          <thead><tr>${isAdmin ? '<th>Santri</th>' : ''}<th>Tanggal</th><th>Sesi</th><th>Jenis</th><th>Surah</th><th>Nilai</th><th>Video</th></tr></thead>
+          <tbody>${rows.map(buildRow).join('')}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  if (isAdmin) {
+    window.__setoranData = res.data;
+    document.getElementById('section-setoranHistory').innerHTML = `
+      <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+        <div><div class="section-title mb-0">Riwayat Setoran</div><div class="section-subtitle mb-0">${res.data.length} total catatan</div></div>
+        <input type="text" class="form-control" style="max-width:240px" placeholder="Cari nama santri..." oninput="filterSetoranHistory(this.value)">
+      </div>
+      <div id="setoranHistoryTableWrap">${renderTable(res.data)}</div>
+    `;
+  } else {
+    document.getElementById('section-setoranHistory').innerHTML = `
+      <div class="section-title">Riwayat Setoran</div>
+      <div class="section-subtitle">${res.data.length} catatan setoran</div>
+      ${renderTable(res.data)}
+    `;
+  }
+}
+
+function filterSetoranHistory(query) {
+  const santriMap = {};
+  AppState.santriCache.forEach(s => santriMap[s.ID] = s.NamaLengkap);
+  const filtered = (window.__setoranData || []).filter(s => (santriMap[s.IDSantri] || '').toLowerCase().includes(query.toLowerCase()));
+  const wrap = document.getElementById('setoranHistoryTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = filtered.length === 0 ? emptyState('bi-search', 'Tidak ditemukan.') : `
+    <div class="card-app"><div class="table-responsive-app"><table class="table-app">
+      <thead><tr><th>Santri</th><th>Tanggal</th><th>Sesi</th><th>Jenis</th><th>Surah</th><th>Nilai</th><th>Video</th></tr></thead>
+      <tbody>${filtered.map(s => `<tr><td>${escapeHtml(santriMap[s.IDSantri] || '-')}</td><td>${s.Tanggal}</td><td>${s.Sesi}</td><td>${s.JenisSetoran}</td><td>${s.Surah} (${s.AyatMulai}-${s.AyatSelesai})</td><td><span class="chip chip-hadir">${s.NilaiTotal}</span></td><td>${s.LinkYoutube ? `<button class="icon-btn" onclick="previewYoutube('${s.LinkYoutube}')"><i class="bi bi-youtube" style="color:#ff0000"></i></button>` : '-'}</td></tr>`).join('')}
+    </table></div></div>`;
+}
+
+function previewYoutube(url) {
+  const embedUrl = url.replace('watch?v=', 'embed/');
+  document.getElementById('previewContent').innerHTML = `<iframe width="100%" height="360" src="${embedUrl}" frameborder="0" allowfullscreen></iframe>`;
+  new bootstrap.Modal(document.getElementById('previewModal')).show();
+}
+
+// ════════════════════════════════════════════════════════
+// ABSENSI
+// ════════════════════════════════════════════════════════
+function loadAttendanceSection() {
+  showLoadingIn('section-attendance');
+  if (AppState.user.role === 'Super Admin') {
+    callServer('attendance', 'getAllSantri', [], res => getSesiListCached(sesiList => renderAttendanceInput(res.success ? res.data : [], sesiList)));
+  } else {
+    callServer('attendance', 'getAbsensiBySantri', [AppState.user.idSantriTerkait], renderAttendanceRekapOrtu);
+  }
+}
+
+function renderAttendanceInput(santriList, sesiList) {
+  const aktif = santriList.filter(s => s.StatusAktif === 'Aktif');
+  const sesiOptions = (sesiList || DAFTAR_SESI_DEFAULT).map(s => `<option>${escapeHtml(s)}</option>`).join('');
+  if (aktif.length === 0) {
+    document.getElementById('section-attendance').innerHTML = emptyState('bi-people', 'Belum ada santri aktif untuk diabsen.');
+    return;
+  }
+  document.getElementById('section-attendance').innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <div><div class="section-title mb-0">Absensi Cepat</div><div class="section-subtitle mb-0">${new Date().toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</div></div>
+      <select class="form-select" style="max-width:140px" id="absenSesi">${sesiOptions}</select>
+    </div>
+    <div class="card-app mb-3">
+      <div class="table-responsive-app">
+        <table class="table-app">
+          <thead><tr><th>Santri</th><th>Status</th></tr></thead>
+          <tbody>
+            ${aktif.map(s => `
+              <tr>
+                <td class="d-flex align-items-center gap-2">${avatarHtml(s.FotoProfilURL, s.NamaLengkap, 32)} ${escapeHtml(s.NamaLengkap)}</td>
+                <td>
+                  <div class="toggle-pill-group" data-santri="${s.ID}">
+                    <button type="button" class="active" data-val="Hadir" onclick="setAbsenStatus(this)">Hadir</button>
+                    <button type="button" data-val="Izin" onclick="setAbsenStatus(this)">Izin</button>
+                    <button type="button" data-val="Sakit" onclick="setAbsenStatus(this)">Sakit</button>
+                    <button type="button" data-val="Alpha" onclick="setAbsenStatus(this)">Alpha</button>
+                  </div>
+                </td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <button class="btn-primary-app" id="btnSimpanAbsen" onclick="submitAbsensi()"><i class="bi bi-save me-1"></i> Simpan Absensi</button>
+  `;
+}
+
+function setAbsenStatus(btn) {
+  const group = btn.parentElement;
+  group.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function submitAbsensi() {
+  const sesi = document.getElementById('absenSesi').value;
+  const tanggal = formatDateForSheet(new Date().toISOString().slice(0, 10));
+  const entries = [];
+  document.querySelectorAll('.toggle-pill-group[data-santri]').forEach(group => {
+    const active = group.querySelector('button.active');
+    entries.push({ idSantri: group.dataset.santri, status: active ? active.dataset.val : 'Hadir', keterangan: '' });
+  });
+  const btn = document.getElementById('btnSimpanAbsen');
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+  google.script.run
+    .withSuccessHandler(res => {
+      btn.innerHTML = '<i class="bi bi-save me-1"></i> Simpan Absensi'; btn.disabled = false;
+      if (res.success) showToast('Berhasil', res.message, 'success');
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => { btn.innerHTML = '<i class="bi bi-save me-1"></i> Simpan Absensi'; btn.disabled = false; showToast('Error', err.message, 'danger'); })
+    .addAbsensiBulk(tanggal, sesi, entries);
+}
+
+function renderAttendanceRekapOrtu(res) {
+  if (!res.success) { document.getElementById('section-attendance').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  const data = res.data;
+  const hadir = data.filter(d => d.Status === 'Hadir').length;
+  const persen = data.length ? Math.round((hadir / data.length) * 100) : 0;
+  document.getElementById('section-attendance').innerHTML = `
+    <div class="section-title">Rekap Kehadiran</div>
+    <div class="card-app mb-3">
+      <div class="d-flex justify-content-between mb-2"><span style="font-size:13.5px;font-weight:600">Persentase Kehadiran</span><span style="font-weight:700;color:var(--primary)">${persen}%</span></div>
+      <div class="progress-app"><div class="progress-app-fill" style="width:${persen}%"></div></div>
+    </div>
+    <div class="card-app">
+      <div class="table-responsive-app">
+        <table class="table-app">
+          <thead><tr><th>Tanggal</th><th>Sesi</th><th>Status</th></tr></thead>
+          <tbody>${data.map(d => `<tr><td>${d.Tanggal}</td><td>${d.Sesi}</td><td><span class="chip chip-${d.Status.toLowerCase()}">${d.Status}</span></td></tr>`).join('')}</tbody>
+        </table>
+        ${data.length === 0 ? emptyState('bi-calendar', 'Belum ada data kehadiran.') : ''}
+      </div>
+    </div>
+  `;
+}
+
+// ════════════════════════════════════════════════════════
+// PAPAN PERINGKAT
+// ════════════════════════════════════════════════════════
+function loadLeaderboard() {
+  showLoadingIn('section-leaderboard');
+  const isOrtu = AppState.user.role !== 'Super Admin';
+  callServer('leaderboard', 'getLeaderboard', [isOrtu], res => renderLeaderboard(res, isOrtu));
+}
+
+function renderLeaderboard(res, isOrtu) {
+  if (!res.success) { document.getElementById('section-leaderboard').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  const medalClass = (rank) => rank === 1 ? 'gold' : rank === 2 ? 'silver' : rank === 3 ? 'bronze' : '';
+  document.getElementById('section-leaderboard').innerHTML = `
+    <div class="section-title"><i class="bi bi-trophy me-1" style="color:var(--secondary-gold)"></i> Papan Peringkat</div>
+    <div class="section-subtitle">Ranking berdasarkan total ayat terhafal</div>
+    <div class="card-app">
+      ${res.data.map(r => `
+        <div class="leaderboard-row">
+          <div class="leaderboard-rank ${medalClass(r.rank)}">${r.rank}</div>
+          ${avatarHtml(r.foto, r.nama, 40)}
+          <div class="flex-fill">
+            <div style="font-weight:600;font-size:14px">${escapeHtml(r.nama)}</div>
+            <div style="font-size:12px;color:var(--text-muted)">${r.totalAyat} ayat terhafal</div>
+          </div>
+          ${!isOrtu ? `<div class="text-end"><div style="font-weight:700;color:var(--primary)">${r.avgNilai}</div><div style="font-size:11px;color:var(--text-muted)">${r.persenHadir}% hadir</div></div>` : ''}
+        </div>`).join('') || emptyState('bi-trophy', 'Belum ada data peringkat.')}
+    </div>
+  `;
+}
+
+// ════════════════════════════════════════════════════════
+// RAPOR SANTRI
+// ════════════════════════════════════════════════════════
+function loadRaporSection() {
+  if (AppState.user.role === 'Super Admin') {
+    showLoadingIn('section-rapor');
+    ensureSantriCache(list => {
+      document.getElementById('section-rapor').innerHTML = `
+        <div class="section-title">Rapor Santri</div>
+        <div class="section-subtitle">Pilih santri untuk melihat rapor lengkap</div>
+        <div class="card-app mb-3">
+          <select class="form-select" id="raporSantriSelect" onchange="selectRaporSantri(this.value)">
+            <option value="">Pilih Santri...</option>
+            ${list.map(s => `<option value="${s.ID}">${escapeHtml(s.NamaLengkap)}</option>`).join('')}
+          </select>
+        </div>
+        <div id="raporContent"></div>
+      `;
+      if (list.length === 0) {
+        document.getElementById('raporContent').innerHTML = emptyState('bi-people', 'Belum ada data santri.');
+      }
+    });
+  } else {
+    document.getElementById('section-rapor').innerHTML = `<div class="section-title">Grafik Perkembangan</div><div id="raporContent"></div>`;
+    if (AppState.user.idSantriTerkait) selectRaporSantri(AppState.user.idSantriTerkait);
+    else document.getElementById('raporContent').innerHTML = emptyState('bi-person-x', 'Akun Anda belum terhubung ke data santri.');
+  }
+}
+
+function selectRaporSantri(idSantri) {
+  if (!idSantri) { document.getElementById('raporContent').innerHTML = ''; return; }
+  const sel = document.getElementById('raporSantriSelect');
+  if (sel) sel.value = idSantri;
+  showLoadingIn('raporContent');
+  callServer('rapor', 'getDashboardOrtu', [idSantri], res => renderRaporContent(res, idSantri));
+}
+
+function renderRaporContent(res, idSantri) {
+  if (!res.success) { document.getElementById('raporContent').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  const d = res.data;
+  document.getElementById('raporContent').innerHTML = `
+    <div class="card-app mb-3 d-flex flex-row align-items-center gap-3 flex-wrap">
+      ${avatarHtml(d.santri.FotoProfilURL, d.santri.NamaLengkap, 64)}
+      <div>
+        <div style="font-family:var(--font-headline);font-weight:700;font-size:18px">${escapeHtml(d.santri.NamaLengkap)}</div>
+        <div style="color:var(--text-muted);font-size:13px">${escapeHtml(d.santri.Nickname || '')}</div>
+      </div>
+      <div class="ms-auto row g-3 text-center">
+        <div class="col"><div class="kpi-value" style="font-size:20px">${d.totalAyat}</div><div style="font-size:11px;color:var(--text-muted)">Total Ayat</div></div>
+        <div class="col"><div class="kpi-value" style="font-size:20px">${d.avgNilai}</div><div style="font-size:11px;color:var(--text-muted)">Avg Nilai</div></div>
+        <div class="col"><div class="kpi-value" style="font-size:20px">${d.persenHadir}%</div><div style="font-size:11px;color:var(--text-muted)">Kehadiran</div></div>
+      </div>
+    </div>
+    <div class="card-app mb-3" id="raporHafalanCard">${emptyState('bi-hourglass', 'Memuat progress hafalan...')}</div>
+    <div class="card-app mb-3">
+      <div class="section-title" style="font-size:16px">Grafik Perkembangan Nilai</div>
+      <canvas id="chartRapor" height="90"></canvas>
+    </div>
+    <div class="card-app">
+      <div class="section-title" style="font-size:16px">Riwayat Setoran Lengkap</div>
+      <div id="raporHistoryTable">${emptyState('bi-hourglass', 'Memuat...')}</div>
+    </div>
+  `;
+  try { renderGrowthChart('chartRapor', d.growthLabels, d.growthValues); } catch (e) { console.error(e); }
+
+  google.script.run
+    .withSuccessHandler(hRes => {
+      const card = document.getElementById('raporHafalanCard');
+      if (!card) return;
+      if (!hRes.success || !hRes.data) { card.innerHTML = `<div class="section-title" style="font-size:16px">Progress Hafalan Keseluruhan</div>` + emptyState('bi-bookmark', 'Belum ada data hafalan diinput Guru.'); return; }
+      const h = hRes.data;
+      const juzList = String(h.JuzDihafal || '').split(',').map(x => x.trim()).filter(Boolean);
+      card.innerHTML = `
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="section-title mb-0" style="font-size:16px">Progress Hafalan Keseluruhan</div>
+          <span style="font-size:11.5px;color:var(--text-muted)">Update: ${h.BulanLabel || h.Bulan}</span>
+        </div>
+        <div class="row g-3 mb-2">
+          <div class="col-6 col-md-3"><div class="kpi-value" style="font-size:22px">${h.TotalJuz || 0}</div><div style="font-size:11px;color:var(--text-muted)">Total Juz</div></div>
+          <div class="col-6 col-md-3"><div class="kpi-value" style="font-size:22px">${h.TotalHalaman || 0}</div><div style="font-size:11px;color:var(--text-muted)">Total Halaman</div></div>
+        </div>
+        ${juzList.length > 0 ? `<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">Juz yang telah dihafal:</div>
+        <div class="d-flex flex-wrap gap-1">${juzList.map(j => `<span class="chip chip-hadir">Juz ${j}</span>`).join('')}</div>` : ''}
+        ${h.Catatan ? `<div class="mt-2" style="font-size:12.5px;color:var(--text-secondary)"><strong>Catatan Guru:</strong> ${escapeHtml(h.Catatan)}</div>` : ''}
+      `;
+    })
+    .withFailureHandler(() => {
+      const card = document.getElementById('raporHafalanCard');
+      if (card) card.innerHTML = emptyState('bi-exclamation-circle', 'Gagal memuat data hafalan.');
+    })
+    .getLatestJumlahHafalanBySantri(idSantri);
+
+  google.script.run
+    .withSuccessHandler(hres => {
+      const table = document.getElementById('raporHistoryTable');
+      if (!table) return;
+      if (!hres.success || hres.data.length === 0) { table.innerHTML = emptyState('bi-journal', 'Belum ada riwayat setoran.'); return; }
+      table.innerHTML = `<div class="table-responsive-app"><table class="table-app">
+        <thead><tr><th>Tanggal</th><th>Jenis</th><th>Surah</th><th>Nilai</th><th>Catatan</th></tr></thead>
+        <tbody>${hres.data.map(s => `<tr><td>${s.Tanggal}</td><td>${s.JenisSetoran}</td><td>${s.Surah} (${s.AyatMulai}-${s.AyatSelesai})</td><td><span class="chip chip-hadir">${s.NilaiTotal}</span></td><td>${escapeHtml(s.CatatanUstadz || '-')}</td></tr>`).join('')}</tbody>
+      </table></div>`;
+    })
+    .withFailureHandler(err => {
+      const table = document.getElementById('raporHistoryTable');
+      if (table) table.innerHTML = emptyState('bi-exclamation-circle', 'Gagal memuat riwayat: ' + err.message);
+    })
+    .getSetoranBySantri(idSantri);
+}
+
+// ════════════════════════════════════════════════════════
+// GENERATOR LAPORAN (ADMIN)
+// ════════════════════════════════════════════════════════
+function loadLaporanSection() {
+  showLoadingIn('section-laporan');
+  ensureSantriCache(list => renderLaporanSection(list));
+}
+
+function renderLaporanSection(santriList) {
+  const options = santriList.map(s => `<option value="${s.ID}" data-email="${escapeHtml(s.EmailOrtu || '')}">${escapeHtml(s.NamaLengkap)}</option>`).join('');
+
+  if (santriList.length === 0) {
+    document.getElementById('section-laporan').innerHTML = emptyState('bi-people', 'Belum ada data santri. Tambahkan santri terlebih dahulu.');
+    return;
+  }
+
+  document.getElementById('section-laporan').innerHTML = `
+    <div class="section-title">Generator Laporan</div>
+    <div class="section-subtitle">Buat laporan siap kirim untuk email atau grup WhatsApp</div>
+    <div class="row g-3">
+      <div class="col-lg-5">
+        <div class="card-app mb-3">
+          <div class="section-title" style="font-size:16px"><i class="bi bi-envelope-paper me-1" style="color:var(--primary)"></i> Laporan Lengkap ke Orang Tua</div>
+          <div class="section-subtitle" style="margin-bottom:10px">Kirim rekap Rapor + Kehadiran langsung via email ke orang tua santri.</div>
+          <label class="form-label">Pilih Santri</label>
+          <select class="form-select mb-2" id="laporanLengkapSantriSelect" onchange="updateLaporanLengkapEmailDisplay()">${options}</select>
+          <label class="form-label">Email Tujuan</label>
+          <input type="text" class="form-control mb-2" id="laporanLengkapEmailDisplay" readonly style="background:var(--surface-container-low)">
+          <button class="btn-outline-app w-100 mb-2" onclick="previewLaporanLengkap()"><i class="bi bi-eye me-1"></i> Lihat Preview</button>
+          <button class="btn-primary-app w-100" onclick="kirimLaporanLengkapHandler()"><i class="bi bi-send me-1"></i> Kirim Laporan Lengkap</button>
+        </div>
+        <div class="card-app mb-3">
+          <div class="section-title" style="font-size:16px">Laporan WhatsApp</div>
+          <div class="toggle-pill-group mb-3" id="waModeToggle">
+            <button type="button" class="active" data-val="harian" onclick="setWaMode(this,'harian')">Harian (Semua)</button>
+            <button type="button" data-val="santri" onclick="setWaMode(this,'santri')">Per Santri</button>
+          </div>
+          <div id="waSantriSelectWrap" class="d-none mb-3">
+            <label class="form-label">Pilih Santri</label>
+            <select class="form-select" id="waSantriSelect">${options}</select>
+          </div>
+          <button class="btn-primary-app w-100" onclick="generateWA()"><i class="bi bi-whatsapp me-1"></i> Generate Teks</button>
+        </div>
+        <div class="card-app">
+          <div class="section-title" style="font-size:16px">Email Manual</div>
+          <label class="form-label">Pilih Santri</label>
+          <select class="form-select mb-2" id="emailSantriSelect" onchange="updateEmailTujuanDisplay()">${options}</select>
+          <label class="form-label">Kepada (Email Orang Tua)</label>
+          <input type="text" class="form-control mb-2" id="emailTujuanDisplay" readonly style="background:var(--surface-container-low)">
+          <label class="form-label">Subjek</label>
+          <input type="text" class="form-control mb-2" id="emailSubjek" placeholder="Subjek email">
+          <label class="form-label">Isi Pesan</label>
+          <textarea class="form-control mb-2" id="emailPesan" rows="4" placeholder="Isi pesan..."></textarea>
+          <button class="btn-outline-app w-100" onclick="kirimEmailManualHandler()"><i class="bi bi-envelope me-1"></i> Kirim Email</button>
+        </div>
+      </div>
+      <div class="col-lg-7">
+        <div class="card-app">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="section-title mb-0" style="font-size:16px">Preview Teks</div>
+            <button class="btn-outline-app" onclick="copyWaText()"><i class="bi bi-clipboard me-1"></i> Copy</button>
+          </div>
+          <textarea class="form-control" id="waPreviewText" rows="20" readonly placeholder="Klik 'Generate Teks' atau 'Lihat Preview' untuk membuat laporan..."></textarea>
+        </div>
+      </div>
+    </div>
+  `;
+  updateEmailTujuanDisplay();
+  updateLaporanLengkapEmailDisplay();
+}
+
+function updateLaporanLengkapEmailDisplay() {
+  const sel = document.getElementById('laporanLengkapSantriSelect');
+  if (!sel) return;
+  const selectedOption = sel.options[sel.selectedIndex];
+  const email = selectedOption ? selectedOption.dataset.email : '';
+  document.getElementById('laporanLengkapEmailDisplay').value = email || '(Email orang tua belum diisi untuk santri ini)';
+}
+
+function previewLaporanLengkap() {
+  const idSantri = document.getElementById('laporanLengkapSantriSelect').value;
+  if (!idSantri) { showToast('Peringatan', 'Pilih santri terlebih dahulu.', 'warning'); return; }
+  google.script.run
+    .withSuccessHandler(res => { document.getElementById('waPreviewText').value = res.success ? res.data : res.message; })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .generateLaporanLengkapText(idSantri);
+}
+
+function kirimLaporanLengkapHandler() {
+  const idSantri = document.getElementById('laporanLengkapSantriSelect').value;
+  if (!idSantri) { showToast('Peringatan', 'Pilih santri terlebih dahulu.', 'warning'); return; }
+  const emailDisplay = document.getElementById('laporanLengkapEmailDisplay').value;
+  if (!emailDisplay || emailDisplay.startsWith('(')) { showToast('Peringatan', 'Santri ini belum memiliki email orang tua.', 'warning'); return; }
+  if (!confirm('Kirim laporan lengkap (Rapor + Kehadiran) ke ' + emailDisplay + '?')) return;
+  google.script.run
+    .withSuccessHandler(res => { if (res.success) showToast('Berhasil', res.message, 'success'); else showToast('Gagal', res.message, 'danger'); })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .kirimLaporanLengkapEmail(idSantri);
+}
+
+function updateEmailTujuanDisplay() {
+  const sel = document.getElementById('emailSantriSelect');
+  if (!sel) return;
+  const selectedOption = sel.options[sel.selectedIndex];
+  const email = selectedOption ? selectedOption.dataset.email : '';
+  document.getElementById('emailTujuanDisplay').value = email || '(Email orang tua belum diisi untuk santri ini)';
+}
+
+function setWaMode(btn, val) {
+  document.querySelectorAll('#waModeToggle button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('waSantriSelectWrap').classList.toggle('d-none', val !== 'santri');
+}
+
+function generateWA() {
+  const mode = document.querySelector('#waModeToggle button.active').dataset.val;
+  const params = mode === 'santri' ? { idSantri: document.getElementById('waSantriSelect').value } : {};
+  google.script.run
+    .withSuccessHandler(res => { document.getElementById('waPreviewText').value = res.success ? res.data : res.message; })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .generateLaporanWA(mode, params);
+}
+
+function copyWaText() {
+  const el = document.getElementById('waPreviewText');
+  el.select();
+  document.execCommand('copy');
+  showToast('Berhasil', 'Teks laporan disalin ke clipboard.', 'success');
+}
+
+function kirimEmailManualHandler() {
+  const idSantri = document.getElementById('emailSantriSelect').value;
+  const subjek = document.getElementById('emailSubjek').value;
+  const pesan = document.getElementById('emailPesan').value;
+  if (!subjek || !pesan) { showToast('Peringatan', 'Lengkapi subjek dan isi pesan.', 'warning'); return; }
+  google.script.run
+    .withSuccessHandler(res => { if (res.success) showToast('Berhasil', res.message, 'success'); else showToast('Gagal', res.message, 'danger'); })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .kirimEmailManual(idSantri, subjek, pesan);
+}
+
+// ════════════════════════════════════════════════════════
+// MODE LIBURAN & MUROJAAH MANDIRI
+// ════════════════════════════════════════════════════════
+function loadLiburanSection() {
+  showLoadingIn('section-liburan');
+  if (AppState.user.role === 'Super Admin') {
+    callServer('liburan', 'getPeriodeLiburanList', [], renderLiburanAdmin);
+  } else {
+    // Cek status liburan TERKINI dari server (jangan pakai cache sesi login yang bisa usang)
+    google.script.run
+      .withSuccessHandler(statusRes => {
+        AppState.user.liburanAktif = (statusRes && statusRes.success) ? statusRes.data : false;
+        callServer('liburan', 'getMurojaahBySantri', [AppState.user.idSantriTerkait], renderLiburanOrtu);
+      })
+      .withFailureHandler(() => {
+        callServer('liburan', 'getMurojaahBySantri', [AppState.user.idSantriTerkait], renderLiburanOrtu);
+      })
+      .checkLiburanAktif();
+  }
+}
+
+function renderLiburanAdmin(res) {
+  const periodeList = res.success ? res.data : [];
+  document.getElementById('section-liburan').innerHTML = `
+    <div class="section-title">Mode Liburan</div>
+    <div class="row g-3 mb-3">
+      <div class="col-lg-5">
+        <div class="card-app">
+          <div class="section-title" style="font-size:16px">Setting Periode Liburan</div>
+          <div class="mb-2"><label class="form-label">Nama Periode</label><input type="text" class="form-control" id="liburanNama" placeholder="Liburan Semester 1"></div>
+          <div class="row g-2 mb-3">
+            <div class="col-6"><label class="form-label">Mulai</label><input type="date" class="form-control" id="liburanMulai"></div>
+            <div class="col-6"><label class="form-label">Selesai</label><input type="date" class="form-control" id="liburanSelesai"></div>
+          </div>
+          <button class="btn-primary-app w-100" onclick="submitPeriodeLiburan()"><i class="bi bi-plus-lg me-1"></i> Tambah Periode</button>
+        </div>
+      </div>
+      <div class="col-lg-7">
+        <div class="card-app">
+          <div class="section-title" style="font-size:16px">Daftar Periode</div>
+          ${periodeList.length === 0 ? emptyState('bi-airplane', 'Belum ada periode liburan.') : periodeList.map(p => `
+            <div class="d-flex justify-content-between align-items-center py-2" style="border-bottom:1px solid var(--border-color-soft)">
+              <div><div style="font-weight:600;font-size:14px">${escapeHtml(p.NamaPeriode)}</div><div style="font-size:12px;color:var(--text-muted)">${p.TanggalMulai} - ${p.TanggalSelesai}</div></div>
+              <span class="chip ${p.Status === 'Aktif' ? 'chip-hadir' : 'chip-alpha'}">${p.Status}</span>
+            </div>`).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="card-app">
+      <div class="section-title" style="font-size:16px">Unggahan Murojaah Mandiri</div>
+      <div id="murojaahReviewList">${emptyState('bi-hourglass', 'Memuat...')}</div>
+    </div>
+  `;
+  loadMurojaahReviewList();
+}
+
+function submitPeriodeLiburan() {
+  const nama = document.getElementById('liburanNama').value;
+  const mulai = document.getElementById('liburanMulai').value;
+  const selesai = document.getElementById('liburanSelesai').value;
+  if (!nama || !mulai || !selesai) { showToast('Peringatan', 'Lengkapi semua field.', 'warning'); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) { showToast('Berhasil', res.message, 'success'); loadLiburanSection(); }
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .addPeriodeLiburan({ NamaPeriode: nama, TanggalMulai: mulai, TanggalSelesai: selesai, Status: 'Aktif' });
+}
+
+function loadMurojaahReviewList() {
+  google.script.run
+    .withSuccessHandler(res => {
+      const wrap = document.getElementById('murojaahReviewList');
+      if (!wrap) return;
+      if (!res.success || res.data.length === 0) { wrap.innerHTML = emptyState('bi-inbox', 'Belum ada unggahan murojaah.'); return; }
+      wrap.innerHTML = res.data.map(m => `
+        <div class="d-flex justify-content-between align-items-start py-2 flex-wrap gap-2" style="border-bottom:1px solid var(--border-color-soft)">
+          <div>
+            <div style="font-weight:600;font-size:14px">${escapeHtml(m.NamaSantri)} — ${m.Surah}</div>
+            <div style="font-size:12px;color:var(--text-muted)">${m.TanggalUpload} · ${escapeHtml(m.CatatanOrtu || '-')}</div>
+            ${m.LinkLampiran ? `<a href="${m.LinkLampiran}" target="_blank" style="font-size:12px">Lihat lampiran</a>` : ''}
+          </div>
+          <div class="text-end">
+            <span class="chip ${m.StatusReview === 'Sudah ditinjau' ? 'chip-review-done' : 'chip-review-pending'} d-block mb-1">${m.StatusReview}</span>
+            ${m.StatusReview !== 'Sudah ditinjau' ? `<button class="btn-outline-app" style="padding:5px 12px;font-size:12px" onclick="openReviewMurojaah('${m.ID}')">Beri Feedback</button>` : ''}
+          </div>
+        </div>`).join('');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .getAllMurojaahForReview();
+}
+
+function openReviewMurojaah(id) {
+  const catatan = prompt('Masukkan catatan/feedback untuk murojaah ini:');
+  if (catatan === null) return;
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) { showToast('Berhasil', res.message, 'success'); loadMurojaahReviewList(); }
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .reviewMurojaah(id, 'Sudah ditinjau', catatan);
+}
+
+function renderLiburanOrtu(res) {
+  const isAktif = AppState.user.liburanAktif;
+  getSurahListCached(surahList => renderLiburanOrtuWithSurah(res, isAktif, surahList));
+}
+
+function renderLiburanOrtuWithSurah(res, isAktif, surahList) {
+  const surahOptions = (surahList || DAFTAR_SURAH).map(s => `<option value="${s}">${s}</option>`).join('');
+  const listHtml = (res.success && res.data.length > 0) ? res.data.map(m => `
+    <div class="d-flex justify-content-between align-items-start py-2" style="border-bottom:1px solid var(--border-color-soft)">
+      <div><div style="font-weight:600;font-size:14px">${m.Surah}</div><div style="font-size:12px;color:var(--text-muted)">${m.TanggalUpload}</div>${m.CatatanUstadz ? `<div style="font-size:12px;color:var(--primary)">Feedback: ${escapeHtml(m.CatatanUstadz)}</div>` : ''}</div>
+      <span class="chip ${m.StatusReview === 'Sudah ditinjau' ? 'chip-review-done' : 'chip-review-pending'}">${m.StatusReview}</span>
+    </div>`).join('') : emptyState('bi-inbox', 'Belum ada unggahan murojaah.');
+
+  document.getElementById('section-liburan').innerHTML = `
+    <div class="section-title">Murojaah Liburan</div>
+    ${!isAktif ? `<div class="card-app">${emptyState('bi-calendar-x', 'Mode liburan sedang tidak aktif. Fitur ini akan tersedia saat periode liburan berlangsung.')}</div>` : `
+      <div class="card-app mb-3">
+        <div class="section-title" style="font-size:16px">Upload Murojaah Mandiri</div>
+        <div class="mb-2"><label class="form-label">Surah</label><select class="form-select" id="murojaahSurah"><option value="">Pilih Surah...</option>${surahOptions}</select></div>
+        <div class="mb-2"><label class="form-label">Catatan</label><textarea class="form-control" id="murojaahCatatan" rows="2" placeholder="Catatan tambahan..."></textarea></div>
+        <div class="mb-3"><label class="form-label">Link Lampiran (YouTube/Drive)</label><input type="url" class="form-control" id="murojaahLink" placeholder="https://..."></div>
+        <button class="btn-primary-app w-100" onclick="submitMurojaah()"><i class="bi bi-upload me-1"></i> Upload</button>
+      </div>
+      <div class="card-app"><div class="section-title" style="font-size:16px">Riwayat Unggahan</div>${listHtml}</div>
+    `}
+  `;
+}
+
+function submitMurojaah() {
+  const surah = document.getElementById('murojaahSurah').value;
+  if (!surah) { showToast('Peringatan', 'Pilih surah terlebih dahulu.', 'warning'); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) { showToast('Berhasil', res.message, 'success'); loadLiburanSection(); }
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .addMurojaahLiburan({
+      IDSantri: AppState.user.idSantriTerkait,
+      Surah: surah,
+      CatatanOrtu: document.getElementById('murojaahCatatan').value,
+      LinkLampiran: document.getElementById('murojaahLink').value
+    });
+}
+
+// ════════════════════════════════════════════════════════
+// DATA MASTER (Surah & data referensi lainnya)
+// ════════════════════════════════════════════════════════
+function loadDataMasterSection() {
+  showLoadingIn('section-dataMaster');
+  callServer('dataMaster', 'getAllKategoriMaster', [], res => {
+    AppState.dataMasterKategoriAktif = (res.success && res.data.length > 0) ? res.data[0] : 'Surah';
+    renderDataMasterShell(res.success ? res.data : ['Surah']);
+  });
+}
+
+function renderDataMasterShell(kategoriList) {
+  if (!kategoriList.includes('Surah')) kategoriList = ['Surah', ...kategoriList];
+  document.getElementById('section-dataMaster').innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <div><div class="section-title mb-0">Data Master</div><div class="section-subtitle mb-0">Kelola data referensi seperti daftar Surah dan lainnya</div></div>
+    </div>
+    <div class="card-app mb-3">
+      <div class="row g-2 align-items-end">
+        <div class="col-md-5">
+          <label class="form-label">Kategori</label>
+          <select class="form-select" id="dataMasterKategoriSelect" onchange="switchDataMasterKategori(this.value)">
+            ${kategoriList.map(k => `<option value="${escapeHtml(k)}">${escapeHtml(k)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="col-md-5">
+          <label class="form-label">Atau Buat Kategori Baru</label>
+          <input type="text" class="form-control" id="dataMasterKategoriBaru" placeholder="Nama kategori baru...">
+        </div>
+        <div class="col-md-2">
+          <button class="btn-outline-app w-100" onclick="addKategoriBaru()">Buat</button>
+        </div>
+      </div>
+    </div>
+    <div class="row g-3">
+      <div class="col-lg-5">
+        <div class="card-app">
+          <div class="section-title" style="font-size:16px">Tambah Data</div>
+          <div class="mb-2"><label class="form-label">Nama</label><input type="text" class="form-control" id="dataMasterNamaInput" placeholder="Contoh: Al-Fatihah"></div>
+          <div class="mb-3"><label class="form-label">Urutan (opsional)</label><input type="number" class="form-control" id="dataMasterUrutanInput" placeholder="Otomatis jika dikosongkan"></div>
+          <button class="btn-primary-app w-100" onclick="submitDataMaster()"><i class="bi bi-plus-lg me-1"></i> Tambah</button>
+        </div>
+      </div>
+      <div class="col-lg-7">
+        <div class="card-app">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="section-title mb-0" style="font-size:16px">Daftar Data — <span id="dataMasterKategoriLabel">Surah</span></div>
+            <span class="chip chip-hadir" id="dataMasterCount">0 item</span>
+          </div>
+          <div id="dataMasterList">${emptyState('bi-hourglass', 'Memuat...')}</div>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('dataMasterKategoriSelect').value = AppState.dataMasterKategoriAktif;
+  loadDataMasterList(AppState.dataMasterKategoriAktif);
+}
+
+function switchDataMasterKategori(kategori) {
+  AppState.dataMasterKategoriAktif = kategori;
+  loadDataMasterList(kategori);
+}
+
+function addKategoriBaru() {
+  const nama = document.getElementById('dataMasterKategoriBaru').value.trim();
+  if (!nama) { showToast('Peringatan', 'Isi nama kategori baru terlebih dahulu.', 'warning'); return; }
+  const select = document.getElementById('dataMasterKategoriSelect');
+  if (![...select.options].some(o => o.value === nama)) {
+    select.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(nama)}">${escapeHtml(nama)}</option>`);
+  }
+  select.value = nama;
+  document.getElementById('dataMasterKategoriBaru').value = '';
+  AppState.dataMasterKategoriAktif = nama;
+  loadDataMasterList(nama);
+  showToast('Info', 'Kategori "' + nama + '" siap dipakai — tambahkan data pertamanya di form kiri.', 'info');
+}
+
+function loadDataMasterList(kategori) {
+  document.getElementById('dataMasterKategoriLabel').textContent = kategori;
+  showLoadingIn('dataMasterList');
+  google.script.run
+    .withSuccessHandler(res => renderDataMasterList(res, kategori))
+    .withFailureHandler(err => { document.getElementById('dataMasterList').innerHTML = emptyState('bi-exclamation-circle', err.message); })
+    .getDataMasterByKategori(kategori);
+}
+
+function renderDataMasterList(res, kategori) {
+  const listEl = document.getElementById('dataMasterList');
+  if (!listEl) return;
+  if (!res.success) { listEl.innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  document.getElementById('dataMasterCount').textContent = res.data.length + ' item';
+  if (res.data.length === 0) { listEl.innerHTML = emptyState('bi-inbox', 'Belum ada data pada kategori ini.'); return; }
+  window.__dataMasterList = res.data;
+  listEl.innerHTML = `
+    <div class="table-responsive-app" style="max-height:480px;overflow-y:auto">
+      <table class="table-app">
+        <thead><tr><th style="width:60px">Urutan</th><th>Nama</th><th></th></tr></thead>
+        <tbody>${res.data.map(d => `
+          <tr>
+            <td>${d.Urutan || '-'}</td>
+            <td><span class="dm-view-${d.ID}">${escapeHtml(d.Nama)}</span></td>
+            <td class="text-end">
+              <button class="icon-btn" onclick="editDataMasterInline('${d.ID}')"><i class="bi bi-pencil"></i></button>
+              <button class="icon-btn text-danger" onclick="handleDeleteDataMaster('${d.ID}')"><i class="bi bi-trash"></i></button>
+            </td>
+          </tr>`).join('')}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function submitDataMaster() {
+  const nama = document.getElementById('dataMasterNamaInput').value.trim();
+  const urutan = document.getElementById('dataMasterUrutanInput').value;
+  if (!nama) { showToast('Peringatan', 'Nama wajib diisi.', 'warning'); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) {
+        showToast('Berhasil', res.message, 'success');
+        document.getElementById('dataMasterNamaInput').value = '';
+        document.getElementById('dataMasterUrutanInput').value = '';
+        AppState.surahListCache = []; // reset cache agar Input Setoran/Murojaah ambil data terbaru
+        loadDataMasterList(AppState.dataMasterKategoriAktif);
+      } else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .addDataMaster({ Kategori: AppState.dataMasterKategoriAktif, Nama: nama, Urutan: urutan || undefined });
+}
+
+function editDataMasterInline(id) {
+  const item = (window.__dataMasterList || []).find(d => d.ID === id);
+  if (!item) return;
+  const namaBaru = prompt('Ubah nama:', item.Nama);
+  if (namaBaru === null || namaBaru.trim() === '') return;
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) { showToast('Berhasil', res.message, 'success'); AppState.surahListCache = []; loadDataMasterList(AppState.dataMasterKategoriAktif); }
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .updateDataMaster({ ID: id, Nama: namaBaru.trim() });
+}
+
+function handleDeleteDataMaster(id) {
+  confirmDeleteAction(() => {
+    google.script.run
+      .withSuccessHandler(res => {
+        if (res.success) { showToast('Berhasil', res.message, 'success'); AppState.surahListCache = []; loadDataMasterList(AppState.dataMasterKategoriAktif); }
+        else showToast('Gagal', res.message, 'danger');
+      })
+      .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+      .deleteDataMaster(id);
+  });
+}
+
+// ════════════════════════════════════════════════════════
+// PENGATURAN (ADMIN) — Akun Ortu + Pengaturan Aplikasi
+// ════════════════════════════════════════════════════════
+function loadSettingsSection() {
+  showLoadingIn('section-settings');
+  const isKoordinator = AppState.user.role === 'Koordinator';
+  document.getElementById('section-settings').innerHTML = `
+    <div class="section-title">Pengaturan</div>
+    <div class="toggle-pill-group mb-3" id="settingsTabToggle">
+      ${isKoordinator ? '' : `<button type="button" class="active" data-val="akun" onclick="switchSettingsTab(this,'akun')">Akun Orang Tua</button>`}
+      <button type="button" class="${isKoordinator ? 'active' : ''}" data-val="aplikasi" onclick="switchSettingsTab(this,'aplikasi')">Pengaturan Aplikasi</button>
+      <button type="button" data-val="wa" onclick="switchSettingsTab(this,'wa')">Template WhatsApp</button>
+    </div>
+    <div id="settingsTabContent">${emptyState('bi-hourglass', 'Memuat...')}</div>
+  `;
+  if (isKoordinator) loadSettingsAplikasiTab();
+  else loadSettingsAkunTab();
+}
+
+function switchSettingsTab(btn, tab) {
+  document.querySelectorAll('#settingsTabToggle button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (tab === 'akun') loadSettingsAkunTab();
+  else if (tab === 'aplikasi') loadSettingsAplikasiTab();
+  else loadSettingsWaTab();
+}
+
+function loadSettingsAkunTab() {
+  showLoadingIn('settingsTabContent');
+  ensureSantriCache(() => {
+    callServer('settingsTabContent', 'getAllAkunOrtu', [], renderSettingsAkunTab);
+  });
+}
+
+function renderSettingsAkunTab(res) {
+  const akunList = res.success ? res.data.filter(a => a.Peran === 'Orang Tua') : [];
+  const santriOptions = AppState.santriCache.map(s => `<option value="${s.ID}">${escapeHtml(s.NamaLengkap)}</option>`).join('');
+  document.getElementById('settingsTabContent').innerHTML = `
+    <div class="row g-3">
+      <div class="col-lg-5">
+        <div class="card-app">
+          <div class="section-title" style="font-size:16px">Tambah Akun Orang Tua</div>
+          ${AppState.santriCache.length === 0 ? `<div class="mb-3" style="font-size:13px;color:var(--text-muted)">Belum ada data santri. Tambahkan santri dulu di menu Data Santri sebelum mendaftarkan akun orang tua.</div>` : `
+          <div class="mb-2"><label class="form-label">Username (untuk login)</label><input type="text" class="form-control" id="akunUsername" placeholder="Contoh: budi01 (singkat & mudah diingat)"></div>
+          <div class="mb-2"><label class="form-label">Password Awal</label><input type="text" class="form-control" id="akunPassword" placeholder="Buat password untuk orang tua ini"></div>
+          <div class="mb-2"><label class="form-label">Email (opsional, untuk notifikasi)</label><input type="email" class="form-control" id="akunEmail" placeholder="ortu@gmail.com"></div>
+          <div class="mb-3"><label class="form-label">Santri Terkait</label>
+            <select class="form-select" id="akunSantri"><option value="">Pilih Santri...</option>${santriOptions}</select>
+          </div>
+          <div style="font-size:12px;color:var(--text-muted)" class="mb-3">Orang tua login pakai <strong>Username + Password</strong> (bukan Google/Email) — lebih mudah untuk yang awam teknologi. Email tetap berguna untuk kirim notifikasi/laporan bila diisi.</div>
+          <button class="btn-primary-app w-100" onclick="submitAkunOrtu()"><i class="bi bi-person-plus me-1"></i> Daftarkan Akun</button>
+          `}
+        </div>
+      </div>
+      <div class="col-lg-7">
+        <div class="card-app">
+          <div class="section-title" style="font-size:16px">Daftar Akun Orang Tua</div>
+          <div class="table-responsive-app">
+            <table class="table-app">
+              <thead><tr><th>Username</th><th>Santri</th><th>Status</th><th>Password</th><th></th></tr></thead>
+              <tbody>${akunList.map(a => `
+                <tr>
+                  <td>${escapeHtml(a.Username || a.Email)}</td><td>${escapeHtml(a.NamaSantri)}</td>
+                  <td><span class="chip ${a.Status === 'Aktif' ? 'chip-hadir' : 'chip-alpha'}">${a.Status}</span></td>
+                  <td>${a.PunyaPassword ? '<span class="chip chip-hadir">Sudah diset</span>' : '<span class="chip chip-alpha">Belum diset</span>'}</td>
+                  <td class="text-nowrap">
+                    <button class="icon-btn" onclick="handleResetPassword('${a.Email}')" title="Reset Password"><i class="bi bi-key"></i></button>
+                    <button class="icon-btn" onclick="toggleAkunStatus('${a.Email}','${a.Status}')" title="Toggle Status"><i class="bi bi-toggle2-on"></i></button>
+                    <button class="icon-btn text-danger" onclick="handleDeleteAkun('${a.Email}')"><i class="bi bi-trash"></i></button>
+                  </td>
+                </tr>`).join('')}</tbody>
+            </table>
+            ${akunList.length === 0 ? emptyState('bi-people', 'Belum ada akun orang tua terdaftar.') : ''}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function handleResetPassword(email) {
+  const newPass = prompt('Masukkan password baru untuk akun ini:');
+  if (newPass === null) return;
+  if (!newPass.trim()) { showToast('Peringatan', 'Password tidak boleh kosong.', 'warning'); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) { showToast('Berhasil', res.message, 'success'); loadSettingsAkunTab(); }
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .resetPasswordOrtu(email, newPass.trim());
+}
+
+function submitAkunOrtu() {
+  const username = document.getElementById('akunUsername').value.trim();
+  const password = document.getElementById('akunPassword').value;
+  const email = document.getElementById('akunEmail').value.trim();
+  const idSantri = document.getElementById('akunSantri').value;
+  if (!username || !password || !idSantri) { showToast('Peringatan', 'Lengkapi username, password, dan santri terkait.', 'warning'); return; }
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) { showToast('Berhasil', res.message, 'success'); loadSettingsAkunTab(); }
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .addAkunOrtu({ Username: username, Email: email || (username + '@local.app'), Password: password, Peran: 'Orang Tua', IDSantriTerkait: idSantri, Status: 'Aktif' });
+}
+
+function toggleAkunStatus(email, currentStatus) {
+  const newStatus = currentStatus === 'Aktif' ? 'Non-aktif' : 'Aktif';
+  google.script.run
+    .withSuccessHandler(res => { if (res.success) { showToast('Berhasil', 'Status akun diperbarui.', 'success'); loadSettingsAkunTab(); } })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .updateAkunOrtu({ Email: email, Status: newStatus });
+}
+
+function handleDeleteAkun(email) {
+  confirmDeleteAction(() => {
+    google.script.run
+      .withSuccessHandler(res => { if (res.success) { showToast('Berhasil', res.message, 'success'); loadSettingsAkunTab(); } else showToast('Gagal', res.message, 'danger'); })
+      .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+      .deleteAkunOrtu(email);
+  });
+}
+
+// ── Tab: Pengaturan Aplikasi (Logo & Warna) ──
+function loadSettingsAplikasiTab() {
+  showLoadingIn('settingsTabContent');
+  callServer('settingsTabContent', 'getAppSettings', [], renderSettingsAplikasiTab);
+}
+
+function renderSettingsAplikasiTab(res) {
+  const settings = res.success ? res.data : { appName: 'SIM Halaqah', logoUrl: '', primaryColor: '#0f5238', secondaryColor: '#C5A059' };
+  document.getElementById('settingsTabContent').innerHTML = `
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="card-app mb-3">
+          <div class="section-title" style="font-size:16px">Identitas Aplikasi</div>
+          <div class="mb-3">
+            <label class="form-label">Nama Aplikasi</label>
+            <input type="text" class="form-control" id="settingAppName" value="${escapeHtml(settings.appName)}">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Logo Aplikasi</label>
+            <div class="d-flex align-items-center gap-3 mb-2">
+              <div class="app-logo-icon" id="logoPreview">${settings.logoUrl ? '' : '<i class="bi bi-book-half"></i>'}</div>
+              <input type="file" class="form-control" id="inputLogoApp" accept="image/*" onchange="previewLogoFile(this)">
+            </div>
+            <input type="hidden" id="settingLogoUrl" value="${settings.logoUrl || ''}">
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card-app mb-3">
+          <div class="section-title" style="font-size:16px">Tema Warna</div>
+          <div class="mb-3">
+            <label class="form-label">Warna Primer (Hijau)</label>
+            <div class="d-flex align-items-center gap-2">
+              <input type="color" class="form-control form-control-color" id="settingPrimaryColor" value="${settings.primaryColor}">
+              <input type="text" class="form-control" id="settingPrimaryColorText" value="${settings.primaryColor}" oninput="document.getElementById('settingPrimaryColor').value=this.value">
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Warna Sekunder (Emas)</label>
+            <div class="d-flex align-items-center gap-2">
+              <input type="color" class="form-control form-control-color" id="settingSecondaryColor" value="${settings.secondaryColor}">
+              <input type="text" class="form-control" id="settingSecondaryColorText" value="${settings.secondaryColor}" oninput="document.getElementById('settingSecondaryColor').value=this.value">
+            </div>
+          </div>
+          <div style="font-size:12px;color:var(--text-muted)">Perubahan warna berlaku untuk semua pengguna setelah disimpan.</div>
+        </div>
+      </div>
+    </div>
+    <button class="btn-primary-app" id="btnSimpanAppSettings" onclick="saveAppSettingsHandler()"><i class="bi bi-save me-1"></i> Simpan Pengaturan Aplikasi</button>
+  `;
+
+  document.getElementById('settingPrimaryColor').addEventListener('input', function () {
+    document.getElementById('settingPrimaryColorText').value = this.value;
+  });
+  document.getElementById('settingSecondaryColor').addEventListener('input', function () {
+    document.getElementById('settingSecondaryColorText').value = this.value;
+  });
+  setLogoImage(document.getElementById('logoPreview'), settings.logoUrl);
+}
+
+function previewLogoFile(input) {
+  if (!input.files || !input.files[0]) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = document.createElement('img');
+    img.src = reader.result;
+    const container = document.getElementById('logoPreview');
+    container.innerHTML = '';
+    container.appendChild(img);
+  };
+  reader.readAsDataURL(input.files[0]);
+}
+
+function saveAppSettingsHandler() {
+  const btn = document.getElementById('btnSimpanAppSettings');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+  const resetBtn = () => { btn.innerHTML = originalText; btn.disabled = false; };
+
+  const settings = {
+    appName: document.getElementById('settingAppName').value || 'SIM Halaqah',
+    primaryColor: document.getElementById('settingPrimaryColor').value,
+    secondaryColor: document.getElementById('settingSecondaryColor').value,
+    logoUrl: document.getElementById('settingLogoUrl').value
+  };
+
+  const finishSave = () => {
+    google.script.run
+      .withSuccessHandler(res => {
+        resetBtn();
+        if (res.success) {
+          showToast('Berhasil', res.message, 'success');
+          applyAppSettings();
+        } else showToast('Gagal', res.message, 'danger');
+      })
+      .withFailureHandler(err => { resetBtn(); showToast('Error', err.message, 'danger'); })
+      .saveAppSettings(settings);
+  };
+
+  const logoInput = document.getElementById('inputLogoApp');
+  if (logoInput.files && logoInput.files[0]) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = reader.result.split(',')[1];
+      google.script.run
+        .withSuccessHandler(uploadRes => {
+          if (uploadRes.success) { settings.logoUrl = uploadRes.data.fileUrl; finishSave(); }
+          else { resetBtn(); showToast('Gagal Upload Logo', uploadRes.message, 'danger'); }
+        })
+        .withFailureHandler(err => { resetBtn(); showToast('Error', err.message, 'danger'); })
+        .uploadFileToDrive(base64, logoInput.files[0].name, logoInput.files[0].type, 'folderId');
+    };
+    reader.readAsDataURL(logoInput.files[0]);
+  } else {
+    finishSave();
+  }
+}
+
+// ── Tab: Template Pesan WhatsApp ──
+function loadSettingsWaTab() {
+  showLoadingIn('settingsTabContent');
+  callServer('settingsTabContent', 'getWaTemplates', [], renderSettingsWaTab);
+}
+
+function renderSettingsWaTab(res) {
+  const t = res.success ? res.data : { templateWaHarian: '', templateWaSantri: '' };
+  document.getElementById('settingsTabContent').innerHTML = `
+    <div class="row g-3">
+      <div class="col-lg-7">
+        <div class="card-app mb-3">
+          <div class="section-title" style="font-size:16px">Template Laporan Harian (Semua Santri)</div>
+          <div class="section-subtitle" style="margin-bottom:10px">Dikirim dari menu Generator Laporan → Laporan WhatsApp → Harian (Semua)</div>
+          <textarea class="form-control mb-2" id="templateWaHarian" rows="7" placeholder="Kosongkan untuk memakai format bawaan...">${escapeHtml(t.templateWaHarian)}</textarea>
+        </div>
+        <div class="card-app mb-3">
+          <div class="section-title" style="font-size:16px">Template Laporan Per Santri</div>
+          <div class="section-subtitle" style="margin-bottom:10px">Dikirim dari menu Generator Laporan → Laporan WhatsApp → Per Santri</div>
+          <textarea class="form-control mb-2" id="templateWaSantri" rows="7" placeholder="Kosongkan untuk memakai format bawaan...">${escapeHtml(t.templateWaSantri)}</textarea>
+        </div>
+        <button class="btn-primary-app" id="btnSimpanWaTemplate" onclick="saveWaTemplatesHandler()"><i class="bi bi-save me-1"></i> Simpan Template</button>
+      </div>
+      <div class="col-lg-5">
+        <div class="card-app">
+          <div class="section-title" style="font-size:16px">Panduan Placeholder</div>
+          <div class="section-subtitle">Ketik placeholder berikut di dalam template — otomatis diganti data asli saat laporan dibuat.</div>
+          <div class="mb-3">
+            <div style="font-weight:600;font-size:13.5px;margin-bottom:6px">Template Harian</div>
+            <table class="table-app" style="font-size:12.5px">
+              <tbody>
+                <tr><td><code>{tanggal}</code></td><td>Tanggal laporan dibuat</td></tr>
+                <tr><td><code>{daftar_setoran}</code></td><td>Daftar semua setoran hari ini (otomatis tersusun rapi)</td></tr>
+                <tr><td><code>{nama_aplikasi}</code></td><td>Nama aplikasi (dari Pengaturan Aplikasi)</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <div style="font-weight:600;font-size:13.5px;margin-bottom:6px">Template Per Santri</div>
+            <table class="table-app" style="font-size:12.5px">
+              <tbody>
+                <tr><td><code>{nama_santri}</code></td><td>Nama lengkap santri</td></tr>
+                <tr><td><code>{tanggal}</code></td><td>Tanggal laporan dibuat</td></tr>
+                <tr><td><code>{daftar_setoran}</code></td><td>5 setoran terakhir santri tsb</td></tr>
+                <tr><td><code>{nama_aplikasi}</code></td><td>Nama aplikasi</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="mt-3" style="font-size:12px;color:var(--text-muted)">Contoh: <br><em>"Assalamu'alaikum, berikut laporan {nama_santri} tanggal {tanggal}: {daftar_setoran} — {nama_aplikasi}"</em></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function saveWaTemplatesHandler() {
+  const btn = document.getElementById('btnSimpanWaTemplate');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+  google.script.run
+    .withSuccessHandler(res => {
+      btn.innerHTML = originalText; btn.disabled = false;
+      if (res.success) showToast('Berhasil', res.message, 'success');
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => { btn.innerHTML = originalText; btn.disabled = false; showToast('Error', err.message, 'danger'); })
+    .saveWaTemplates({
+      templateWaHarian: document.getElementById('templateWaHarian').value,
+      templateWaSantri: document.getElementById('templateWaSantri').value
+    });
+}
+
+// ════════════════════════════════════════════════════════
+// PENGUMUMAN (ADMIN) — juga tampil di lonceng notifikasi
+// ════════════════════════════════════════════════════════
+function loadPengumumanSection() {
+  showLoadingIn('section-pengumuman');
+  callServer('pengumuman', 'getAllPengumuman', [AppState.user.role], renderPengumumanSection);
+}
+
+function renderPengumumanSection(res) {
+  const list = res.success ? res.data : [];
+  const targetLabel = AppState.user.role === 'Koordinator' ? 'Guru/Ustadz (Admin)' : 'Orang Tua';
+  document.getElementById('section-pengumuman').innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <div><div class="section-title mb-0">Pengumuman</div><div class="section-subtitle mb-0">Hanya tampil untuk ${targetLabel} — tidak berlaku ke atas</div></div>
+      <button class="btn-primary-app" onclick="openPengumumanModal(null)"><i class="bi bi-plus-lg me-1"></i> Buat Pengumuman</button>
+    </div>
+    <div class="row g-3">
+      ${list.length === 0 ? `<div class="col-12">${emptyState('bi-megaphone', 'Belum ada pengumuman. Buat yang pertama!')}</div>` : list.map(p => `
+        <div class="col-md-6">
+          <div class="card-app">
+            <div class="d-flex justify-content-between align-items-start mb-2">
+              <div style="font-weight:700;font-size:15px">${escapeHtml(p.Judul)}</div>
+              <span class="chip ${p.Status === 'Aktif' ? 'chip-hadir' : 'chip-alpha'}">${p.Status}</span>
+            </div>
+            <div style="font-size:13px;color:var(--text-secondary);white-space:pre-wrap;margin-bottom:8px">${escapeHtml(p.Isi)}</div>
+            ${p.LampiranURL ? `<a href="${p.LampiranURL}" target="_blank" class="d-block mb-1" style="font-size:12.5px"><i class="bi bi-paperclip"></i> ${escapeHtml(p.LampiranNama || 'Lampiran')}</a>` : ''}
+            ${p.LinkEksternal ? `<a href="${p.LinkEksternal}" target="_blank" class="d-block mb-2" style="font-size:12.5px"><i class="bi bi-link-45deg"></i> ${escapeHtml(p.LinkEksternal)}</a>` : ''}
+            <div class="d-flex justify-content-between align-items-center mt-2">
+              <span style="font-size:11.5px;color:var(--text-muted)">${p.TanggalDibuat}</span>
+              <div>
+                <button class="icon-btn" onclick='openPengumumanModalById("${p.ID}")'><i class="bi bi-pencil"></i></button>
+                <button class="icon-btn text-danger" onclick="handleDeletePengumuman('${p.ID}')"><i class="bi bi-trash"></i></button>
+              </div>
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>
+  `;
+  window.__pengumumanList = list;
+}
+
+function openPengumumanModalById(id) {
+  const item = (window.__pengumumanList || []).find(p => p.ID === id);
+  openPengumumanModal(item || null);
+}
+
+function openPengumumanModal(item) {
+  const form = document.getElementById('formPengumuman');
+  form.reset();
+  document.getElementById('modalPengumumanTitle').textContent = item ? 'Edit Pengumuman' : 'Buat Pengumuman';
+  document.getElementById('inputLampiranPengumuman').value = '';
+  if (item) {
+    Object.keys(item).forEach(k => {
+      const field = form.querySelector(`[name="${k}"]`);
+      if (field) field.value = item[k];
+    });
+  }
+  new bootstrap.Modal(document.getElementById('modalPengumuman')).show();
+}
+
+function savePengumumanForm() {
+  const form = document.getElementById('formPengumuman');
+  if (!form.checkValidity()) { form.reportValidity(); return; }
+  const formData = new FormData(form);
+  const record = {};
+  formData.forEach((v, k) => record[k] = v);
+  if (!record.ID) delete record.ID;
+
+  const btn = document.getElementById('btnSimpanPengumuman');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+  const resetBtn = () => { btn.innerHTML = originalText; btn.disabled = false; };
+
+  const finishSave = () => {
+    const action = record.ID ? 'updatePengumuman' : 'addPengumuman';
+    google.script.run
+      .withSuccessHandler(res => {
+        resetBtn();
+        if (res.success) {
+          showToast('Berhasil', res.message, 'success');
+          bootstrap.Modal.getInstance(document.getElementById('modalPengumuman')).hide();
+          loadPengumumanSection();
+          loadNotifBadge();
+        } else showToast('Gagal', res.message, 'danger');
+      })
+      .withFailureHandler(err => { resetBtn(); showToast('Error', err.message, 'danger'); })
+      [action](record);
+  };
+
+  const lampiranInput = document.getElementById('inputLampiranPengumuman');
+  if (lampiranInput.files && lampiranInput.files[0]) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = reader.result.split(',')[1];
+      google.script.run
+        .withSuccessHandler(uploadRes => {
+          if (uploadRes.success) { record.LampiranURL = uploadRes.data.fileUrl; record.LampiranNama = uploadRes.data.fileName; finishSave(); }
+          else { resetBtn(); showToast('Gagal Upload', uploadRes.message, 'danger'); }
+        })
+        .withFailureHandler(err => { resetBtn(); showToast('Error', err.message, 'danger'); })
+        .uploadFileToDrive(base64, lampiranInput.files[0].name, lampiranInput.files[0].type, 'folderId');
+    };
+    reader.readAsDataURL(lampiranInput.files[0]);
+  } else {
+    finishSave();
+  }
+}
+
+function handleDeletePengumuman(id) {
+  confirmDeleteAction(() => {
+    google.script.run
+      .withSuccessHandler(res => {
+        if (res.success) { showToast('Berhasil', res.message, 'success'); loadPengumumanSection(); loadNotifBadge(); }
+        else showToast('Gagal', res.message, 'danger');
+      })
+      .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+      .deletePengumuman(id);
+  });
+}
+
+// ════════════════════════════════════════════════════════
+// DATA GURU (KOORDINATOR)
+// ════════════════════════════════════════════════════════
+function loadDataGuruSection() {
+  showLoadingIn('section-dataGuru');
+  callServer('dataGuru', 'getAllDataGuru', [], renderDataGuruSection);
+}
+
+function renderDataGuruSection(res) {
+  const list = res.success ? res.data : [];
+  AppState.guruCache = list;
+  document.getElementById('section-dataGuru').innerHTML = `
+    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+      <div><div class="section-title mb-0">Data Guru</div><div class="section-subtitle mb-0">${list.length} guru terdaftar — menambah guru otomatis memberi akses login (Google)</div></div>
+      <button class="btn-primary-app d-none d-lg-inline-flex" onclick="openGuruModal(null)"><i class="bi bi-plus-lg me-1"></i> Tambah Guru</button>
+    </div>
+    <div class="row g-3">
+      ${list.length === 0 ? `<div class="col-12">${emptyState('bi-person-badge', 'Belum ada guru terdaftar. Klik tombol tambah untuk memulai.')}</div>` : list.map(g => `
+        <div class="col-md-6 col-lg-4">
+          <div class="card-app santri-card">
+            <div class="santri-card-top">
+              ${avatarHtml('', g.NamaLengkap, 48)}
+              <div class="flex-fill">
+                <div class="santri-card-name">${escapeHtml(g.NamaLengkap)}</div>
+                <div class="santri-card-sub">${escapeHtml(g.Email)}</div>
+              </div>
+              <div class="dropdown">
+                <button class="icon-btn" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>
+                <ul class="dropdown-menu dropdown-menu-end">
+                  <li><a class="dropdown-item" href="javascript:void(0)" onclick="openGuruModalById('${g.ID}')"><i class="bi bi-pencil me-2"></i>Edit</a></li>
+                  <li><a class="dropdown-item" href="javascript:void(0)" onclick="toggleGuruStatusHandler('${g.ID}','${g.Status}')"><i class="bi bi-toggle2-on me-2"></i>${g.Status === 'Aktif' ? 'Nonaktifkan' : 'Aktifkan'}</a></li>
+                  <li><a class="dropdown-item text-danger" href="javascript:void(0)" onclick="handleDeleteGuru('${g.ID}')"><i class="bi bi-trash me-2"></i>Hapus &amp; Cabut Akses</a></li>
+                </ul>
+              </div>
+            </div>
+            <div class="santri-target-box d-flex justify-content-between align-items-center">
+              <div>
+                <div style="font-size:12px;color:var(--text-muted)">No. WhatsApp</div>
+                <div style="font-size:13.5px;font-weight:600">${escapeHtml(g.NoWhatsapp || '-')}</div>
+              </div>
+              <span class="chip ${g.Status === 'Aktif' ? 'chip-hadir' : 'chip-alpha'}">${g.Status}</span>
+            </div>
+            <div class="d-flex justify-content-between align-items-center">
+              <span style="font-size:12px;color:var(--text-muted)">Bergabung ${g.TanggalBergabung}</span>
+              <span class="chip chip-review-pending"><i class="bi bi-people"></i> ${g.JumlahSantri} santri</span>
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>
+  `;
+}
+
+function openGuruModalById(id) {
+  const item = (AppState.guruCache || []).find(g => g.ID === id);
+  openGuruModal(item || null);
+}
+
+function openGuruModal(guruObj) {
+  const form = document.getElementById('formGuru');
+  form.reset();
+  document.getElementById('modalGuruTitle').textContent = guruObj ? 'Edit Guru' : 'Tambah Guru';
+  if (guruObj) {
+    Object.keys(guruObj).forEach(k => {
+      const field = form.querySelector(`[name="${k}"]`);
+      if (field) field.value = guruObj[k];
+    });
+  }
+  new bootstrap.Modal(document.getElementById('modalGuru')).show();
+}
+
+function saveGuruForm() {
+  const form = document.getElementById('formGuru');
+  if (!form.checkValidity()) { form.reportValidity(); return; }
+  const formData = new FormData(form);
+  const record = {};
+  formData.forEach((v, k) => record[k] = v);
+  if (!record.ID) delete record.ID;
+
+  const btn = document.getElementById('btnSimpanGuru');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+
+  const action = record.ID ? 'updateDataGuru' : 'addDataGuru';
+  google.script.run
+    .withSuccessHandler(res => {
+      btn.innerHTML = originalText; btn.disabled = false;
+      if (res.success) {
+        showToast('Berhasil', res.message, 'success');
+        bootstrap.Modal.getInstance(document.getElementById('modalGuru')).hide();
+        loadDataGuruSection();
+      } else { showToast('Gagal', res.message, 'danger'); }
+    })
+    .withFailureHandler(err => { btn.innerHTML = originalText; btn.disabled = false; showToast('Error', err.message, 'danger'); })
+    [action](record);
+}
+
+function toggleGuruStatusHandler(id, currentStatus) {
+  const newStatus = currentStatus === 'Aktif' ? 'Non-aktif' : 'Aktif';
+  google.script.run
+    .withSuccessHandler(res => {
+      if (res.success) { showToast('Berhasil', 'Status guru diperbarui.', 'success'); loadDataGuruSection(); }
+      else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+    .updateDataGuru({ ID: id, Status: newStatus });
+}
+
+function handleDeleteGuru(id) {
+  confirmDeleteAction(() => {
+    google.script.run
+      .withSuccessHandler(res => {
+        if (res.success) { showToast('Berhasil', res.message, 'success'); loadDataGuruSection(); }
+        else showToast('Gagal', res.message, 'danger');
+      })
+      .withFailureHandler(err => showToast('Error', err.message, 'danger'))
+      .deleteDataGuru(id);
+  });
+}
+
+// ════════════════════════════════════════════════════════
+// JUMLAH HAFALAN SANTRI (GURU) — update bulanan + pengingat
+// ════════════════════════════════════════════════════════
+function loadJumlahHafalanSection() {
+  showLoadingIn('section-jumlahHafalan');
+  ensureSantriCache(() => {
+    google.script.run
+      .withSuccessHandler(reminderRes => {
+        google.script.run
+          .withSuccessHandler(hafalanRes => renderJumlahHafalanSection(reminderRes, hafalanRes))
+          .withFailureHandler(err => { document.getElementById('section-jumlahHafalan').innerHTML = emptyState('bi-exclamation-circle', err.message); })
+          .getAllJumlahHafalan();
+      })
+      .withFailureHandler(err => { document.getElementById('section-jumlahHafalan').innerHTML = emptyState('bi-exclamation-circle', err.message); })
+      .getReminderHafalanBulanIni();
+  });
+}
+
+function renderJumlahHafalanSection(reminderRes, hafalanRes) {
+  if (!reminderRes.success) { document.getElementById('section-jumlahHafalan').innerHTML = emptyState('bi-exclamation-circle', reminderRes.message); return; }
+  const r = reminderRes.data;
+  const hafalanList = hafalanRes.success ? hafalanRes.data : [];
+
+  // Peta record TERBARU per santri
+  const latestMap = {};
+  hafalanList.forEach(h => {
+    if (!latestMap[h.IDSantri] || h.Bulan > latestMap[h.IDSantri].Bulan) latestMap[h.IDSantri] = h;
+  });
+  AppState.hafalanLatestMap = latestMap;
+
+  const santriAktif = AppState.santriCache.filter(s => s.StatusAktif === 'Aktif');
+
+  document.getElementById('section-jumlahHafalan').innerHTML = `
+    <div class="section-title">Jumlah Hafalan Santri</div>
+    <div class="section-subtitle">Update progress hafalan (juz &amp; halaman) setiap santri — wajib diperbarui tiap bulan</div>
+
+    <div class="card-app mb-3" style="border-left:4px solid ${r.totalBelumUpdate > 0 ? 'var(--danger)' : 'var(--primary)'}">
+      <div class="d-flex align-items-center gap-3 flex-wrap">
+        <i class="bi ${r.totalBelumUpdate > 0 ? 'bi-exclamation-triangle' : 'bi-check-circle'}" style="font-size:28px;color:${r.totalBelumUpdate > 0 ? 'var(--danger)' : 'var(--primary)'}"></i>
+        <div class="flex-fill">
+          <div style="font-weight:700;font-size:15px">
+            ${r.totalBelumUpdate > 0 ? `${r.totalBelumUpdate} dari ${r.totalSantri} santri belum diupdate bulan ${r.bulanLabel}` : `Semua santri sudah diupdate bulan ${r.bulanLabel}`}
+          </div>
+          ${r.totalBelumUpdate > 0 ? `<div style="font-size:12.5px;color:var(--text-muted)">${r.daftarBelumUpdate.map(s => escapeHtml(s.nama)).join(', ')}</div>` : ''}
+        </div>
+      </div>
+    </div>
+
+    <div class="card-app">
+      <div class="table-responsive-app">
+        <table class="table-app">
+          <thead><tr><th>Santri</th><th>Juz Terakhir</th><th>Halaman</th><th>Update Terakhir</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            ${santriAktif.map(s => {
+              const h = latestMap[s.ID];
+              const isUpToDate = h && h.Bulan === r.bulanIni;
+              return `<tr>
+                <td class="d-flex align-items-center gap-2">${avatarHtml(s.FotoProfilURL, s.NamaLengkap, 32)} ${escapeHtml(s.NamaLengkap)}</td>
+                <td>${h ? h.TotalJuz : '-'}</td>
+                <td>${h ? h.TotalHalaman : '-'}</td>
+                <td>${h ? h.BulanLabel : 'Belum pernah'}</td>
+                <td><span class="chip ${isUpToDate ? 'chip-hadir' : 'chip-alpha'}">${isUpToDate ? 'Sudah Update' : 'Perlu Update'}</span></td>
+                <td><button class="btn-outline-app" style="padding:6px 14px;font-size:12.5px" onclick="openHafalanModal('${s.ID}')"><i class="bi bi-pencil-square me-1"></i>Update</button></td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+        ${santriAktif.length === 0 ? emptyState('bi-people', 'Belum ada santri aktif.') : ''}
+      </div>
+    </div>
+  `;
+}
+
+function openHafalanModal(idSantri) {
+  const santri = AppState.santriCache.find(s => s.ID === idSantri);
+  if (!santri) return;
+  const existing = (AppState.hafalanLatestMap || {})[idSantri];
+  const bulanIni = new Date().toISOString().slice(0, 7);
+
+  document.getElementById('modalJumlahHafalanTitle').textContent = 'Update Hafalan — ' + santri.NamaLengkap;
+  document.getElementById('hafalanIDSantri').value = idSantri;
+  document.getElementById('hafalanBulan').value = (existing && existing.Bulan === bulanIni) ? existing.Bulan : bulanIni;
+  document.getElementById('hafalanTotalJuz').value = existing ? existing.TotalJuz : '';
+  document.getElementById('hafalanTotalHalaman').value = existing ? existing.TotalHalaman : '';
+  document.getElementById('hafalanCatatan').value = existing ? (existing.Catatan || '') : '';
+
+  const juzDihafal = existing ? String(existing.JuzDihafal || '').split(',').map(x => x.trim()).filter(Boolean) : [];
+  const grid = document.getElementById('hafalanJuzGrid');
+  grid.innerHTML = '';
+  for (let i = 1; i <= 30; i++) {
+    const checked = juzDihafal.includes(String(i));
+    grid.insertAdjacentHTML('beforeend', `
+      <label class="chip ${checked ? 'chip-hadir' : ''}" style="cursor:pointer;border:1px solid var(--border-color);user-select:none" onclick="this.classList.toggle('chip-hadir')">
+        <input type="checkbox" class="hafalan-juz-check" value="${i}" ${checked ? 'checked' : ''} style="display:none">Juz ${i}
+      </label>
+    `);
+  }
+  new bootstrap.Modal(document.getElementById('modalJumlahHafalan')).show();
+}
+
+function submitJumlahHafalan() {
+  const idSantri = document.getElementById('hafalanIDSantri').value;
+  const bulan = document.getElementById('hafalanBulan').value;
+  const totalJuz = document.getElementById('hafalanTotalJuz').value;
+  if (!bulan || totalJuz === '') { showToast('Peringatan', 'Bulan dan Total Juz wajib diisi.', 'warning'); return; }
+
+  const juzChecked = [...document.querySelectorAll('.hafalan-juz-check:checked')].map(el => el.value);
+
+  const record = {
+    IDSantri: idSantri,
+    Bulan: bulan,
+    TotalJuz: totalJuz,
+    TotalHalaman: document.getElementById('hafalanTotalHalaman').value || 0,
+    JuzDihafal: juzChecked.join(','),
+    Catatan: document.getElementById('hafalanCatatan').value
+  };
+
+  const btn = document.getElementById('btnSimpanHafalan');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Menyimpan...';
+  btn.disabled = true;
+
+  google.script.run
+    .withSuccessHandler(res => {
+      btn.innerHTML = originalText; btn.disabled = false;
+      if (res.success) {
+        showToast('Berhasil', res.message, 'success');
+        bootstrap.Modal.getInstance(document.getElementById('modalJumlahHafalan')).hide();
+        loadJumlahHafalanSection();
+      } else showToast('Gagal', res.message, 'danger');
+    })
+    .withFailureHandler(err => { btn.innerHTML = originalText; btn.disabled = false; showToast('Error', err.message, 'danger'); })
+    .upsertJumlahHafalan(record);
+}
+
+// ════════════════════════════════════════════════════════
+// DASHBOARD ANALISA (KOORDINATOR)
+// ════════════════════════════════════════════════════════
+function loadDashboardKoordinator() {
+  showLoadingIn('section-dashboard');
+  callServer('dashboard', 'getDashboardKoordinator', [], renderDashboardKoordinator);
+}
+
+function renderDashboardKoordinator(res) {
+  if (!res.success) { document.getElementById('section-dashboard').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  const d = res.data;
+  document.getElementById('section-dashboard').innerHTML = `
+    <div class="card-hero mb-4 d-flex justify-content-between align-items-center flex-wrap gap-3">
+      <div>
+        <h2>Assalamu'alaikum, Koordinator!</h2>
+        <p>Pantauan menyeluruh: ${d.totalGuru} guru aktif membimbing ${d.totalSantri} santri di seluruh halaqah.</p>
+      </div>
+      <button class="btn-gold-app" onclick="navigateTo('laporanOrganisasi')"><i class="bi bi-bar-chart-line me-1"></i> Lihat Laporan Lengkap</button>
+    </div>
+
+    <div class="row g-3 mb-4">
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-person-badge"></i></div><div><div class="kpi-label">Total Guru</div><div class="kpi-value">${d.totalGuru}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-people"></i></div><div><div class="kpi-label">Total Santri</div><div class="kpi-value">${d.totalSantri}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-book"></i></div><div><div class="kpi-label">Ayat Terhafal</div><div class="kpi-value">${d.totalAyat}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-star"></i></div><div><div class="kpi-label">Rata-rata Nilai</div><div class="kpi-value">${d.avgNilai}</div></div></div></div>
+    </div>
+
+    <div class="card-app mb-4">
+      <div class="section-title">Grafik Perkembangan Hafalan Organisasi</div>
+      <div class="section-subtitle">Total ayat terhafal seluruh santri, 7 hari terakhir</div>
+      <canvas id="chartGrowthKoordinator" height="90"></canvas>
+    </div>
+
+    <div class="card-app">
+      <div class="section-title">Breakdown per Guru</div>
+      <div class="table-responsive-app">
+        <table class="table-app">
+          <thead><tr><th>Guru</th><th>Jumlah Santri</th><th>Status</th></tr></thead>
+          <tbody>${d.guruBreakdown.map(g => `<tr><td>${escapeHtml(g.nama)}</td><td>${g.jumlahSantri}</td><td><span class="chip ${g.status === 'Aktif' ? 'chip-hadir' : 'chip-alpha'}">${g.status}</span></td></tr>`).join('')}</tbody>
+        </table>
+        ${d.guruBreakdown.length === 0 ? emptyState('bi-person-badge', 'Belum ada guru terdaftar. Tambahkan lewat menu Data Guru.') : ''}
+      </div>
+    </div>
+  `;
+  try { renderGrowthChart('chartGrowthKoordinator', d.growthLabels, d.growthValues); } catch (e) { console.error(e); }
+}
+
+// ════════════════════════════════════════════════════════
+// GENERATE LAPORAN ORGANISASI (KOORDINATOR)
+// ════════════════════════════════════════════════════════
+function loadLaporanOrganisasiSection() {
+  showLoadingIn('section-laporanOrganisasi');
+  callServer('laporanOrganisasi', 'getLaporanOrganisasi', [], renderLaporanOrganisasiSection);
+}
+
+function renderLaporanOrganisasiSection(res) {
+  if (!res.success) { document.getElementById('section-laporanOrganisasi').innerHTML = emptyState('bi-exclamation-circle', res.message); return; }
+  const d = res.data;
+  document.getElementById('section-laporanOrganisasi').innerHTML = `
+    <div class="section-title">Generate Laporan — Seluruh Data Aplikasi</div>
+    <div class="section-subtitle">Rekap menyeluruh guru, santri, hafalan, dan kehadiran</div>
+
+    <div class="row g-3 mb-3">
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-person-badge"></i></div><div><div class="kpi-label">Total Guru Aktif</div><div class="kpi-value">${d.totalGuru}</div></div></div></div>
+      <div class="col-6 col-lg-3"><div class="card-app kpi-card"><div class="kpi-icon"><i class="bi bi-people"></i></div><div><div class="kpi-label">Total Santri Aktif</div><div class="kpi-value">${d.totalSantri}</div></div></div></div>
+    </div>
+
+    <div class="card-app mb-3">
+      <div class="section-title" style="font-size:16px">Rekap Jumlah Guru</div>
+      <div class="table-responsive-app">
+        <table class="table-app">
+          <thead><tr><th>Nama Guru</th><th>Email</th><th>Jumlah Santri</th><th>Status</th></tr></thead>
+          <tbody>${d.rekapGuru.map(g => `<tr><td>${escapeHtml(g.NamaLengkap)}</td><td>${escapeHtml(g.Email)}</td><td>${g.JumlahSantri}</td><td><span class="chip ${g.Status === 'Aktif' ? 'chip-hadir' : 'chip-alpha'}">${g.Status}</span></td></tr>`).join('')}</tbody>
+        </table>
+        ${d.rekapGuru.length === 0 ? emptyState('bi-person-badge', 'Belum ada guru terdaftar.') : ''}
+      </div>
+    </div>
+
+    <div class="card-app">
+      <div class="section-title" style="font-size:16px">Rekap Santri — Data, Hafalan &amp; Kehadiran</div>
+      <div class="table-responsive-app">
+        <table class="table-app">
+          <thead><tr><th>Nama Santri</th><th>Guru</th><th>Status</th><th>Total Juz</th><th>Halaman</th><th>Update Hafalan</th><th>Kehadiran</th></tr></thead>
+          <tbody>${d.rekapSantri.map(s => `
+            <tr>
+              <td>${escapeHtml(s.nama)}</td>
+              <td>${escapeHtml(s.guru)}</td>
+              <td><span class="chip ${s.status === 'Aktif' ? 'chip-hadir' : 'chip-alpha'}">${s.status}</span></td>
+              <td>${s.totalJuz}</td>
+              <td>${s.totalHalaman}</td>
+              <td>${s.bulanUpdateTerakhir}</td>
+              <td>${s.persenHadir}%</td>
+            </tr>`).join('')}</tbody>
+        </table>
+        ${d.rekapSantri.length === 0 ? emptyState('bi-people', 'Belum ada santri terdaftar.') : ''}
+      </div>
+    </div>
+  `;
+}
+</script>
