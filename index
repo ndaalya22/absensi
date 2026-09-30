@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIM Halaqah</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <?!= include('Stylesheet') ?>
+</head>
+<body>
+
+  <!-- Loading Overlay -->
+  <div id="loadingOverlay" class="loading-overlay">
+    <div class="loading-spinner"></div>
+    <p class="mt-3">Memuat SIM Halaqah...</p>
+  </div>
+
+  <!-- Error Screen (akun tidak terdaftar / tidak login) -->
+  <div id="errorScreen" class="error-screen d-none">
+    <div class="error-card">
+      <i class="bi bi-shield-exclamation"></i>
+      <h4>Akses Ditolak</h4>
+      <p id="errorScreenMsg">Terjadi kesalahan.</p>
+    </div>
+  </div>
+
+  <!-- Login Screen Orang Tua (manual, Username + Password) -->
+  <div id="ortuLoginScreen" class="error-screen d-none">
+    <div class="error-card" style="max-width:420px">
+      <i class="bi bi-people" style="color:var(--primary)"></i>
+      <h4>Login Orang Tua</h4>
+      <p id="ortuLoginHint" style="font-size:13px">Masuk menggunakan username &amp; password yang telah didaftarkan oleh Guru/Ustadz.</p>
+      <form id="formOrtuLogin" class="text-start mt-3" onsubmit="return false;">
+        <div class="mb-3">
+          <label class="form-label">Username</label>
+          <input type="text" class="form-control" id="ortuLoginEmail" placeholder="username" required>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Password</label>
+          <input type="password" class="form-control" id="ortuLoginPassword" placeholder="Password" required>
+        </div>
+        <div id="ortuLoginError" class="text-danger mb-2 d-none" style="font-size:13px"></div>
+        <button type="submit" class="btn-primary-app w-100" id="btnOrtuLogin" onclick="submitOrtuLogin()"><i class="bi bi-box-arrow-in-right me-1"></i> Masuk</button>
+      </form>
+      <p class="mt-3 mb-0" style="font-size:12px;color:var(--text-muted)">Guru/Admin: silakan buka halaman ini menggunakan akun Google yang terdaftar.</p>
+    </div>
+  </div>
+
+  <div id="appShell" class="d-none">
+
+    <!-- Sidebar (Desktop) -->
+    <nav id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <div class="app-logo-icon" id="appLogoIcon"><i class="bi bi-book-half"></i></div>
+        <div>
+          <h5 id="appTitle">SIM Halaqah</h5>
+          <span class="app-subtitle">Management System</span>
+        </div>
+      </div>
+
+      <ul class="sidebar-nav" id="sidebarNav"><!-- diisi dinamis oleh renderNavigation() --></ul>
+
+      <div class="sidebar-footer">
+        <div class="form-check form-switch dark-mode-switch">
+          <input class="form-check-input" type="checkbox" id="darkModeToggle" onchange="toggleDarkMode()">
+          <label class="form-check-label" for="darkModeToggle">
+            <i class="bi bi-moon-stars"></i> Mode Gelap
+          </label>
+        </div>
+        <div class="user-chip" id="userChip"></div>
+      </div>
+    </nav>
+
+    <!-- Sidebar Overlay (mobile drawer) -->
+    <div id="sidebarOverlay" class="sidebar-overlay" onclick="closeSidebarDrawer()"></div>
+
+    <!-- Main Content -->
+    <main id="mainContent" class="main-content">
+
+      <!-- Topbar -->
+      <div class="topbar">
+        <button class="icon-btn d-lg-none" onclick="openSidebarDrawer()"><i class="bi bi-list"></i></button>
+        <div class="topbar-search d-none d-md-flex">
+          <i class="bi bi-search"></i>
+          <input type="text" placeholder="Cari santri...">
+        </div>
+        <div class="topbar-right">
+          <button class="icon-btn d-md-none" onclick="toggleDarkMode()"><i class="bi bi-moon-stars"></i></button>
+          <span class="topbar-badge-icon" id="notifBellBtn" onclick="toggleNotifPanel()"><i class="bi bi-bell"></i><span class="badge-dot d-none" id="notifBadgeDot"></span></span>
+          <div class="notif-panel d-none" id="notifPanel">
+            <div class="d-flex justify-content-between align-items-center px-2 pt-1 pb-2">
+              <strong style="font-size:14px">Pengumuman</strong>
+              <button class="btn-close" style="font-size:11px" onclick="toggleNotifPanel()"></button>
+            </div>
+            <div id="notifPanelContent"></div>
+          </div>
+          <div class="topbar-user d-none d-md-flex" id="topbarUser"></div>
+          <button class="btn-quick-attendance d-none d-md-inline-flex" id="btnQuickAbsen" onclick="navigateTo('attendance')">
+            <i class="bi bi-check2-circle"></i> Absensi Cepat
+          </button>
+        </div>
+      </div>
+
+      <div class="content-inner">
+        <!-- Section: Dashboard -->
+        <section id="section-dashboard" class="content-section active"></section>
+
+        <!-- Section: Data Santri (Admin) -->
+        <section id="section-santriData" class="content-section"></section>
+
+        <!-- Section: Input Setoran (Admin) -->
+        <section id="section-setoranInput" class="content-section"></section>
+
+        <!-- Section: Riwayat Setoran (Both) -->
+        <section id="section-setoranHistory" class="content-section"></section>
+
+        <!-- Section: Absensi -->
+        <section id="section-attendance" class="content-section"></section>
+
+        <!-- Section: Papan Peringkat -->
+        <section id="section-leaderboard" class="content-section"></section>
+
+        <!-- Section: Rapor Santri -->
+        <section id="section-rapor" class="content-section"></section>
+
+        <!-- Section: Generator Laporan (Admin) -->
+        <section id="section-laporan" class="content-section"></section>
+
+        <!-- Section: Mode Liburan -->
+        <section id="section-liburan" class="content-section"></section>
+
+        <!-- Section: Data Master (Admin) -->
+        <section id="section-dataMaster" class="content-section"></section>
+
+        <!-- Section: Jumlah Hafalan Santri (Admin) -->
+        <section id="section-jumlahHafalan" class="content-section"></section>
+
+        <!-- Section: Data Guru (Koordinator) -->
+        <section id="section-dataGuru" class="content-section"></section>
+
+        <!-- Section: Laporan Organisasi (Koordinator) -->
+        <section id="section-laporanOrganisasi" class="content-section"></section>
+
+        <!-- Section: Pengumuman (Admin) -->
+        <section id="section-pengumuman" class="content-section"></section>
+
+        <!-- Section: Pengaturan (Admin) -->
+        <section id="section-settings" class="content-section"></section>
+      </div>
+    </main>
+
+    <!-- Bottom Navigation (Mobile) -->
+    <nav id="bottomNav" class="bottom-nav"></nav>
+    <button class="fab-add d-lg-none" id="fabAdd" onclick="handleFabClick()"><i class="bi bi-plus-lg"></i></button>
+  </div>
+
+  <!-- Modal: Form Santri -->
+  <div class="modal fade" id="modalSantri" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="modalSantriTitle">Tambah Santri</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <form id="formSantri">
+            <input type="hidden" name="ID">
+            <div class="mb-3">
+              <label class="form-label">Nama Lengkap</label>
+              <input type="text" class="form-control" name="NamaLengkap" required>
+            </div>
+            <div class="row">
+              <div class="col-6 mb-3">
+                <label class="form-label">Nickname</label>
+                <input type="text" class="form-control" name="Nickname">
+              </div>
+              <div class="col-6 mb-3">
+                <label class="form-label">Tanggal Lahir</label>
+                <input type="date" class="form-control" name="TanggalLahir">
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Nama Orang Tua</label>
+              <input type="text" class="form-control" name="NamaOrtu">
+            </div>
+            <div class="row">
+              <div class="col-7 mb-3">
+                <label class="form-label">Email Orang Tua</label>
+                <input type="email" class="form-control" name="EmailOrtu" required>
+              </div>
+              <div class="col-5 mb-3">
+                <label class="form-label">No. WhatsApp</label>
+                <input type="text" class="form-control" name="NoWhatsappOrtu">
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Foto Profil</label>
+              <input type="file" class="form-control" id="inputFotoSantri" accept="image/*">
+              <input type="hidden" name="FotoProfilURL">
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Guru Pengampu (opsional)</label>
+              <select class="form-select" name="IDGuru" id="inputGuruPengampu">
+                <option value="">Belum ditentukan</option>
+              </select>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Status</label>
+              <select class="form-select" name="StatusAktif">
+                <option value="Aktif">Aktif</option>
+                <option value="Non-aktif">Non-aktif</option>
+              </select>
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>
+          <button type="button" class="btn btn-primary-app" id="btnSimpanSantri" onclick="saveSantriForm()">
+            <i class="bi bi-save"></i> Simpan
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Form Jumlah Hafalan Santri -->
+  <div class="modal fade" id="modalJumlahHafalan" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="modalJumlahHafalanTitle">Update Jumlah Hafalan</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <form id="formJumlahHafalan">
+            <input type="hidden" id="hafalanIDSantri">
+            <div class="row g-3 mb-3">
+              <div class="col-md-4">
+                <label class="form-label">Bulan</label>
+                <input type="month" class="form-control" id="hafalanBulan" required>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Total Juz</label>
+                <input type="number" step="0.5" min="0" max="30" class="form-control" id="hafalanTotalJuz" required>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Total Halaman</label>
+                <input type="number" min="0" class="form-control" id="hafalanTotalHalaman">
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Juz yang Sudah Dihafal</label>
+              <div id="hafalanJuzGrid" class="d-flex flex-wrap gap-2"></div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Catatan (opsional)</label>
+              <textarea class="form-control" id="hafalanCatatan" rows="2"></textarea>
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>
+          <button type="button" class="btn btn-primary-app" id="btnSimpanHafalan" onclick="submitJumlahHafalan()">
+            <i class="bi bi-save"></i> Simpan
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Form Data Guru -->
+  <div class="modal fade" id="modalGuru" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="modalGuruTitle">Tambah Guru</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <form id="formGuru">
+            <input type="hidden" name="ID">
+            <div class="mb-3">
+              <label class="form-label">Nama Lengkap</label>
+              <input type="text" class="form-control" name="NamaLengkap" required>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Email Google (untuk login)</label>
+              <input type="email" class="form-control" name="Email" required>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">No. WhatsApp</label>
+              <input type="text" class="form-control" name="NoWhatsapp">
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Status</label>
+              <select class="form-select" name="Status">
+                <option value="Aktif">Aktif</option>
+                <option value="Non-aktif">Non-aktif</option>
+              </select>
+            </div>
+            <div style="font-size:12px;color:var(--text-muted)">Guru akan otomatis bisa login ke aplikasi ini menggunakan akun Google dengan email di atas.</div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>
+          <button type="button" class="btn btn-primary-app" id="btnSimpanGuru" onclick="saveGuruForm()">
+            <i class="bi bi-save"></i> Simpan
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Form Pengumuman -->
+  <div class="modal fade" id="modalPengumuman" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="modalPengumumanTitle">Tambah Pengumuman</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <form id="formPengumuman">
+            <input type="hidden" name="ID">
+            <div class="mb-3">
+              <label class="form-label">Judul</label>
+              <input type="text" class="form-control" name="Judul" required>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Isi Pengumuman</label>
+              <textarea class="form-control" name="Isi" rows="4" required></textarea>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Lampiran Foto/Dokumen (opsional)</label>
+              <input type="file" class="form-control" id="inputLampiranPengumuman">
+              <input type="hidden" name="LampiranURL">
+              <input type="hidden" name="LampiranNama">
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Atau Link Eksternal (opsional)</label>
+              <input type="url" class="form-control" name="LinkEksternal" placeholder="https://...">
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Status</label>
+              <select class="form-select" name="Status">
+                <option value="Aktif">Aktif (tampil di notifikasi)</option>
+                <option value="Non-aktif">Non-aktif (disembunyikan)</option>
+              </select>
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>
+          <button type="button" class="btn btn-primary-app" id="btnSimpanPengumuman" onclick="savePengumumanForm()">
+            <i class="bi bi-save"></i> Simpan
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Preview (Foto / Video / Dokumen) -->
+  <div class="modal fade" id="previewModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Pratinjau</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body text-center" id="previewContent"></div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Tutup</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Konfirmasi Hapus -->
+  <div class="modal fade" id="deleteModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Konfirmasi Hapus</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="mb-0">Apakah Anda yakin ingin menghapus data ini? Tindakan ini tidak dapat dibatalkan.</p>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Batal</button>
+          <button type="button" class="btn btn-danger" id="confirmDeleteBtn">Hapus</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div class="toast-container position-fixed bottom-0 end-0 p-3">
+    <div id="appToast" class="toast" role="alert">
+      <div class="toast-header">
+        <span class="toast-icon me-2" id="toastIcon"></span>
+        <strong class="me-auto" id="toastTitle">Notifikasi</strong>
+        <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+      </div>
+      <div class="toast-body" id="toastBody"></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <?!= include('JavaScript') ?>
+</body>
+</html>
